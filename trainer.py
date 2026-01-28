@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 IFS=$'\n\t'
+umask "${UMASK:-022}"
 
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_VERSION="1.0.0"
@@ -158,6 +159,14 @@ prompt_choice() {
   printf -v "$var_name" '%s' "$value"
 }
 
+validate_base_dir() {
+  local dir="${1:?}"
+  [[ -n "$dir" ]] || die "Base directory must not be empty."
+  if [[ "$dir" == "/" ]]; then
+    die "Base directory must not be '/'. Set BASE_DIR to a safe path."
+  fi
+}
+
 slugify() {
   # Lowercase, keep alnum, convert spaces/dashes to underscore, collapse repeats.
   echo -n "${1:?}" \
@@ -188,9 +197,11 @@ require_free_disk_gb() {
 pip_install() {
   # First try prefer-binary to avoid source builds on Pi.
   local -a pkgs=("$@")
-  python -m pip install --prefer-binary "${pkgs[@]}" || {
+  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
+    python -m pip install --prefer-binary --no-input --disable-pip-version-check "${pkgs[@]}" || {
     log "pip prefer-binary failed for: ${pkgs[*]} — retrying without prefer-binary."
-    python -m pip install "${pkgs[@]}"
+    PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
+      python -m pip install --no-input --disable-pip-version-check "${pkgs[@]}"
   }
 }
 
@@ -244,13 +255,12 @@ main() {
   local logs_dir="${LOGS_DIR:-$base_dir/logs}"
   local custom_models_dir="${CUSTOM_MODELS_DIR:-$base_dir/custom_models}"
 
+  validate_base_dir "$base_dir"
   mkdir -p "$base_dir" "$runs_dir" "$logs_dir" "$custom_models_dir"
   require_free_disk_gb "$base_dir" "${MIN_FREE_DISK_GB:-8}"
 
   local apt_stamp="$logs_dir/.apt_updated"
   if command -v apt-get >/dev/null 2>&1; then
-    apt_update_once "$apt_stamp"
-
     # Core tooling
     local -a req_pkgs=(
       ca-certificates
@@ -293,28 +303,36 @@ main() {
       if ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
     done
     if [[ ${#to_install[@]} -gt 0 ]]; then
+      apt_update_once "$apt_stamp"
+    fi
+    if [[ ${#to_install[@]} -gt 0 ]]; then
       log "Installing required apt packages..."
       apt_install_many "${to_install[@]}"
     else
       log "Required apt packages already installed."
     fi
 
-    to_install=()
-    for p in "${opt_py_pkgs[@]}"; do
-      if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
-    done
-    if [[ ${#to_install[@]} -gt 0 ]]; then
-      log "Installing optional python-related apt packages (speed/compat on Pi)..."
-      apt_install_many "${to_install[@]}"
-    fi
+    if [[ "${INSTALL_OPTIONAL_APT:-1}" == "1" ]]; then
+      apt_update_once "$apt_stamp"
+      to_install=()
+      for p in "${opt_py_pkgs[@]}"; do
+        if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
+      done
+      if [[ ${#to_install[@]} -gt 0 ]]; then
+        log "Installing optional python-related apt packages (speed/compat on Pi)..."
+        apt_install_many "${to_install[@]}"
+      fi
 
-    to_install=()
-    for p in "${maybe_pkgs[@]}"; do
-      if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
-    done
-    if [[ ${#to_install[@]} -gt 0 ]]; then
-      log "Installing additional optional apt packages that are available on this OS..."
-      apt_install_many "${to_install[@]}"
+      to_install=()
+      for p in "${maybe_pkgs[@]}"; do
+        if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
+      done
+      if [[ ${#to_install[@]} -gt 0 ]]; then
+        log "Installing additional optional apt packages that are available on this OS..."
+        apt_install_many "${to_install[@]}"
+      fi
+    else
+      log "Skipping optional apt packages (INSTALL_OPTIONAL_APT=0)."
     fi
   else
     die "apt-get not found. This script currently targets Debian/Raspberry Pi OS/Ubuntu."
@@ -350,7 +368,9 @@ main() {
 
   # shellcheck disable=SC1091
   source "$venv_dir/bin/activate"
-  python -m pip install -U pip setuptools wheel || die "pip bootstrap/upgrade failed."
+  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
+    python -m pip install -U --no-input --disable-pip-version-check pip setuptools wheel \
+    || die "pip bootstrap/upgrade failed."
 
   # Install baseline Python deps (best-effort superset for training flows)
   log "Installing Python packages (best-effort superset for openWakeWord training + Piper dataset gen)..."
