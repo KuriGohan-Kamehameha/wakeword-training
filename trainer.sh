@@ -570,11 +570,17 @@ main() {
 
   local have_wyoming_piper=0
   local have_wyoming_oww=0
+  local have_local_wyoming_piper=0
+  local have_local_wyoming_oww=0
   if port_open "$host_piper" "$port_piper" 1; then have_wyoming_piper=1; fi
   if port_open "$host_oww" "$port_oww" 1; then have_wyoming_oww=1; fi
+  if port_open "127.0.0.1" "$port_piper" 1; then have_local_wyoming_piper=1; fi
+  if port_open "127.0.0.1" "$port_oww" 1; then have_local_wyoming_oww=1; fi
 
   log "Detected: wyoming-piper on ${host_piper}:${port_piper} => ${have_wyoming_piper}"
   log "Detected: wyoming-openwakeword on ${host_oww}:${port_oww} => ${have_wyoming_oww}"
+  log "Detected: wyoming-piper on localhost:${port_piper} => ${have_local_wyoming_piper}"
+  log "Detected: wyoming-openwakeword on localhost:${port_oww} => ${have_local_wyoming_oww}"
 
   if is_raspberry_pi; then
     log "Platform: Raspberry Pi detected."
@@ -719,20 +725,26 @@ main() {
   # Install baseline Python deps (best-effort superset for training flows)
   log "Installing Python packages (best-effort superset for openWakeWord training + Piper dataset gen)..."
   install_tflite_runtime_if_available || log "WARNING: tflite-runtime setup failed; continuing without it."
-  pip_install \
-    pyyaml \
-    numpy \
-    scipy \
-    soundfile \
-    resampy \
-    tqdm \
-    matplotlib \
-    scikit-learn \
-    onnx \
-    onnxruntime \
-    datasets \
-    speechbrain \
-    piper-tts
+  local -a pip_pkgs=(
+    pyyaml
+    numpy
+    scipy
+    soundfile
+    resampy
+    tqdm
+    matplotlib
+    scikit-learn
+    onnx
+    onnxruntime
+    datasets
+    speechbrain
+  )
+  if [[ "$have_local_wyoming_piper" -eq 1 ]]; then
+    log "Local wyoming-piper detected; skipping piper-tts install."
+  else
+    pip_pkgs+=(piper-tts)
+  fi
+  pip_install "${pip_pkgs[@]}"
 
   # Try to ensure torch exists (training often needs it; if your distro provided python3-torch, this may already pass)
   if ! python_import_check torch >/dev/null 2>&1; then
@@ -743,11 +755,19 @@ main() {
   fi
 
   # Install openWakeWord from the repo (editable)
-  log "Installing openWakeWord from local repo (editable)..."
-  if ! python -m pip install -e "$repo_dir" ; then
-    die "Failed to install openWakeWord from $repo_dir"
+  local skip_openwakeword_install=0
+  if [[ "$have_local_wyoming_oww" -eq 1 ]] && python_import_check openwakeword >/dev/null 2>&1; then
+    skip_openwakeword_install=1
+    log "Local wyoming-openwakeword detected and openwakeword importable; skipping editable install."
   fi
-  python_import_check openwakeword >/dev/null 2>&1 || die "openwakeword import check failed after install."
+
+  if [[ "$skip_openwakeword_install" -eq 0 ]]; then
+    log "Installing openWakeWord from local repo (editable)..."
+    if ! python -m pip install -e "$repo_dir" ; then
+      die "Failed to install openWakeWord from $repo_dir"
+    fi
+    python_import_check openwakeword >/dev/null 2>&1 || die "openwakeword import check failed after install."
+  fi
 
   # User inputs
   local wake_phrase="${WAKE_PHRASE:-}"
@@ -971,6 +991,8 @@ EOF
   echo "If you already run Wyoming services:"
   echo "  wyoming-openwakeword detected on ${host_oww}:${port_oww} => ${have_wyoming_oww}"
   echo "  wyoming-piper        detected on ${host_piper}:${port_piper} => ${have_wyoming_piper}"
+  echo "  localhost openwakeword detected on ${port_oww} => ${have_local_wyoming_oww}"
+  echo "  localhost piper       detected on ${port_piper} => ${have_local_wyoming_piper}"
   echo
   echo "To serve a trained .tflite via Wyoming openWakeWord, the server commonly listens on 10400 and supports --custom-model-dir. :contentReference[oaicite:6]{index=6}"
   echo "=== END ==="
