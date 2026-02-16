@@ -514,16 +514,12 @@ parse_args() {
 }
 
 main() {
-  # Initialize NON_INTERACTIVE and NO_TMUX with defaults
-  NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
-  NO_TMUX="${NO_TMUX:-0}"
-  
   parse_args "$@"
 
   if [[ -n "$CLI_BASE_DIR" ]]; then
     BASE_DIR="$CLI_BASE_DIR"
   fi
-  if [[ "$CLI_ALLOW_LOW_DISK" == "1" ]]; then
+  if [[ "$CLI_ALLOW_LOW_DISK" -eq 1 ]]; then
     ALLOW_LOW_DISK=1
   fi
   if [[ -n "$CLI_MIN_FREE_DISK_GB" ]]; then
@@ -571,11 +567,15 @@ main() {
   if [[ -n "$CLI_UMASK" ]]; then
     UMASK="$CLI_UMASK"
   fi
-  if [[ "$CLI_NON_INTERACTIVE" == "1" ]]; then
+  if [[ "$CLI_NON_INTERACTIVE" -eq 1 ]]; then
     NON_INTERACTIVE=1
+  else
+    NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
   fi
-  if [[ "$CLI_NO_TMUX" == "1" ]]; then
+  if [[ "$CLI_NO_TMUX" -eq 1 ]]; then
     NO_TMUX=1
+  else
+    NO_TMUX="${NO_TMUX:-0}"
   fi
 
   umask "${UMASK:-022}"
