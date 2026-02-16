@@ -57,3 +57,25 @@ Key options for CLI mode:
 - `--train-threads NUMBER` - Number of CPU threads to use
 - `--non-interactive` - Skip all interactive prompts; use defaults or provided values
 - `--no-tmux` - Run training in current terminal instead of tmux session
+
+## Testing
+
+To test the training script without actually running a full training session, you can use the `--help` flag to verify the CLI arguments are recognized:
+
+```bash
+bash trainer.sh --help
+```
+
+For quick testing in non-interactive mode:
+
+```bash
+# Test with minimal parameters (will use defaults for everything else)
+bash trainer.sh \
+  --wake-phrase "test phrase" \
+  --train-profile tiny \
+  --train-threads 1 \
+  --non-interactive \
+  --no-tmux
+```
+
+**Note**: The script automatically detects when it's not running in a TTY (e.g., in CI/CD pipelines) and will use default values for any parameters not explicitly provided, even without the `--non-interactive` flag.
