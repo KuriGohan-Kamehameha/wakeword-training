@@ -34,6 +34,8 @@ Options:
   --wyoming-oww-host HOST    Overrides WYOMING_OPENWAKEWORD_HOST.
   --wyoming-oww-port PORT    Overrides WYOMING_OPENWAKEWORD_PORT.
   --umask MASK               Overrides UMASK (e.g., 022).
+  --non-interactive          Skip all prompts; use defaults or env vars.
+  --no-tmux                  Run training in current shell (no tmux session).
   --help, -h                 Show this help and exit.
 
 Environment overrides (if no flags provided):
@@ -62,6 +64,8 @@ CLI_WYOMING_PIPER_PORT=""
 CLI_WYOMING_OWW_HOST=""
 CLI_WYOMING_OWW_PORT=""
 CLI_UMASK=""
+CLI_NON_INTERACTIVE=0
+CLI_NO_TMUX=0
 
 # ------------------------------
 # Logging / Error handling
@@ -175,11 +179,12 @@ prompt_nonempty() {
   if [[ -n "${!var_name:-}" ]]; then
     value="${!var_name}"
   else
-    if [[ -t 0 ]]; then
+    if [[ -t 0 && "$NON_INTERACTIVE" -ne 1 ]]; then
       read -r -p "${prompt_text} [${default_value}]: " value || true
       value="${value:-$default_value}"
     else
       value="$default_value"
+      [[ "$NON_INTERACTIVE" -eq 1 ]] && log "Non-interactive mode: ${var_name}=${value}"
     fi
   fi
 
@@ -200,11 +205,12 @@ prompt_choice() {
   if [[ -n "${!var_name:-}" ]]; then
     value="${!var_name}"
   else
-    if [[ -t 0 ]]; then
+    if [[ -t 0 && "$NON_INTERACTIVE" -ne 1 ]]; then
       read -r -p "${prompt_text} [${default_value}] (choices: ${choices[*]}): " value || true
       value="${value:-$default_value}"
     else
       value="$default_value"
+      [[ "$NON_INTERACTIVE" -eq 1 ]] && log "Non-interactive mode: ${var_name}=${value}"
     fi
   fi
 
@@ -488,6 +494,14 @@ parse_args() {
         CLI_UMASK="${1#*=}"
         shift
         ;;
+      --non-interactive)
+        CLI_NON_INTERACTIVE=1
+        shift
+        ;;
+      --no-tmux)
+        CLI_NO_TMUX=1
+        shift
+        ;;
       --)
         shift
         break
@@ -505,7 +519,7 @@ main() {
   if [[ -n "$CLI_BASE_DIR" ]]; then
     BASE_DIR="$CLI_BASE_DIR"
   fi
-  if [[ "$CLI_ALLOW_LOW_DISK" == "1" ]]; then
+  if [[ "$CLI_ALLOW_LOW_DISK" -eq 1 ]]; then
     ALLOW_LOW_DISK=1
   fi
   if [[ -n "$CLI_MIN_FREE_DISK_GB" ]]; then
@@ -552,6 +566,20 @@ main() {
   fi
   if [[ -n "$CLI_UMASK" ]]; then
     UMASK="$CLI_UMASK"
+  fi
+  
+  # Initialize NON_INTERACTIVE from CLI or environment (default to 0)
+  if [[ "$CLI_NON_INTERACTIVE" -eq 1 ]]; then
+    NON_INTERACTIVE=1
+  else
+    NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
+  fi
+  
+  # Initialize NO_TMUX from CLI or environment (default to 0)
+  if [[ "$CLI_NO_TMUX" -eq 1 ]]; then
+    NO_TMUX=1
+  else
+    NO_TMUX="${NO_TMUX:-0}"
   fi
 
   umask "${UMASK:-022}"
@@ -970,17 +998,24 @@ log "Done."
 EOF
   chmod +x "$train_sh"
 
-  # Start tmux session
+  # Start tmux session or run directly
   local session="wakeword_${model_slug}_${run_id}"
-  if tmux has-session -t "$session" >/dev/null 2>&1; then
-    die "tmux session already exists: $session"
+  
+  if [[ "$NO_TMUX" -eq 1 ]]; then
+    log "Running training directly (--no-tmux mode)..."
+    bash "$train_sh"
+  else
+    if tmux has-session -t "$session" >/dev/null 2>&1; then
+      die "tmux session already exists: $session"
+    fi
+
+    log "Launching training in tmux session: $session"
+    tmux new-session -d -s "$session" "bash -lc '$train_sh'"
+
+    # Post-flight info (tell it like it is)
+    log "tmux session started."
   fi
 
-  log "Launching training in tmux session: $session"
-  tmux new-session -d -s "$session" "bash -lc '$train_sh'"
-
-  # Post-flight info (tell it like it is)
-  log "tmux session started."
   echo
   echo "=== STARTED ==="
   echo "Wake phrase      : $wake_phrase"
@@ -989,9 +1024,11 @@ EOF
   echo "Log file         : $run_dir/training.log"
   echo "Custom models dir: $custom_models_dir"
   echo
-  echo "Attach to training:"
-  echo "  tmux attach -t $session"
-  echo
+  if [[ "$NO_TMUX" -ne 1 ]]; then
+    echo "Attach to training:"
+    echo "  tmux attach -t $session"
+    echo
+  fi
   echo "If you already run Wyoming services:"
   echo "  wyoming-openwakeword detected on ${host_oww}:${port_oww} => ${have_wyoming_oww}"
   echo "  wyoming-piper        detected on ${host_piper}:${port_piper} => ${have_wyoming_piper}"
