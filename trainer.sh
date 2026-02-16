@@ -567,11 +567,15 @@ main() {
   if [[ -n "$CLI_UMASK" ]]; then
     UMASK="$CLI_UMASK"
   fi
+  
+  # Initialize NON_INTERACTIVE from CLI or environment (default to 0)
   if [[ "$CLI_NON_INTERACTIVE" -eq 1 ]]; then
     NON_INTERACTIVE=1
   else
     NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
   fi
+  
+  # Initialize NO_TMUX from CLI or environment (default to 0)
   if [[ "$CLI_NO_TMUX" -eq 1 ]]; then
     NO_TMUX=1
   else
