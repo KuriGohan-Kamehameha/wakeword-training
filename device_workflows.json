@@ -1,0 +1,85 @@
+{
+  "default": {
+    "formats": [
+      "tflite",
+      "onnx"
+    ],
+    "default_format": "tflite",
+    "profile": "medium",
+    "threads": 1,
+    "piper_host": "kulfi.local",
+    "piper_port": 10200,
+    "oww_host": "kulfi.local",
+    "oww_port": 10400,
+    "notes": "Generic output. Override format/profile as needed."
+  },
+  "devices": [
+    {
+      "id": "respeaker_xvf3800",
+      "label": "ReSpeaker XVF3800",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "threads": 2,
+      "notes": "Use .tflite for on-device wake word. Copy into your firmware or wyoming-openwakeword custom-model-dir."
+    },
+    {
+      "id": "respeaker_2mic_pi_hat",
+      "label": "ReSpeaker 2-Mics Pi HAT",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "threads": 2,
+      "notes": "Use .tflite and serve via wyoming-openwakeword or on-device runtime."
+    },
+    {
+      "id": "respeaker_4mic_pi_hat",
+      "label": "ReSpeaker 4-Mics Pi HAT",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "threads": 2,
+      "notes": "Use .tflite and serve via wyoming-openwakeword or on-device runtime."
+    },
+    {
+      "id": "esphome_generic",
+      "label": "ESPHome (generic)",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "threads": 2,
+      "notes": "ESPHome wake word components expect .tflite models."
+    },
+    {
+      "id": "anki_vector_wirepod",
+      "label": "Anki Vector (wire-pod)",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "threads": 2,
+      "notes": "Wire-pod supports custom wake words via openWakeWord. Provide the .tflite in your wire-pod custom model directory."
+    },
+    {
+      "id": "custom_manual",
+      "label": "Custom / Manual",
+      "formats": [
+        "tflite",
+        "onnx"
+      ],
+      "default_format": "tflite",
+      "profile": "medium",
+      "threads": 1,
+      "notes": "Manual selection. Choose format and profile for your target." 
+    }
+  ]
+}
