@@ -29,6 +29,7 @@ Options:
   --wake-phrase TEXT         Overrides WAKE_PHRASE.
   --train-profile NAME       Overrides TRAIN_PROFILE (tiny|medium|large).
   --train-threads NUMBER     Overrides TRAIN_THREADS.
+  --model-format NAME        Overrides MODEL_FORMAT (tflite|onnx|both).
   --wyoming-piper-host HOST  Overrides WYOMING_PIPER_HOST.
   --wyoming-piper-port PORT  Overrides WYOMING_PIPER_PORT.
   --wyoming-oww-host HOST    Overrides WYOMING_OPENWAKEWORD_HOST.
@@ -41,7 +42,7 @@ Options:
 Environment overrides (if no flags provided):
   BASE_DIR, ALLOW_LOW_DISK, MIN_FREE_DISK_GB, RUNS_DIR, LOGS_DIR, VENV_DIR,
   OWW_REPO_DIR, CUSTOM_MODELS_DIR, TRAIN_PROFILE, TRAIN_THREADS, WAKE_PHRASE,
-  INSTALL_OPTIONAL_APT, WYOMING_PIPER_HOST, WYOMING_PIPER_PORT,
+  INSTALL_OPTIONAL_APT, MODEL_FORMAT, WYOMING_PIPER_HOST, WYOMING_PIPER_PORT,
   WYOMING_OPENWAKEWORD_HOST, WYOMING_OPENWAKEWORD_PORT, UMASK.
 EOF
 }
@@ -59,6 +60,7 @@ CLI_INSTALL_OPTIONAL_APT=""
 CLI_WAKE_PHRASE=""
 CLI_TRAIN_PROFILE=""
 CLI_TRAIN_THREADS=""
+CLI_MODEL_FORMAT=""
 CLI_WYOMING_PIPER_HOST=""
 CLI_WYOMING_PIPER_PORT=""
 CLI_WYOMING_OWW_HOST=""
@@ -121,8 +123,18 @@ port_open() {
   local host="${1:?}"
   local port="${2:?}"
   local timeout_s="${3:-1}"
-  require_cmd timeout
-  timeout "${timeout_s}" bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+  # Use Python socket connect with timeout (cross-platform, avoids external 'timeout')
+  python - <<PY >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(${timeout_s})
+try:
+    s.connect(("${host}", int(${port})))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
 }
 
 # ------------------------------
@@ -449,6 +461,15 @@ parse_args() {
         CLI_TRAIN_THREADS="${1#*=}"
         shift
         ;;
+      --model-format)
+        [[ -n "${2:-}" ]] || die "--model-format requires a value."
+        CLI_MODEL_FORMAT="$2"
+        shift 2
+        ;;
+      --model-format=*)
+        CLI_MODEL_FORMAT="${1#*=}"
+        shift
+        ;;
       --wyoming-piper-host)
         [[ -n "${2:-}" ]] || die "--wyoming-piper-host requires a host."
         CLI_WYOMING_PIPER_HOST="$2"
@@ -552,6 +573,9 @@ main() {
   if [[ -n "$CLI_TRAIN_THREADS" ]]; then
     TRAIN_THREADS="$CLI_TRAIN_THREADS"
   fi
+  if [[ -n "$CLI_MODEL_FORMAT" ]]; then
+    MODEL_FORMAT="$CLI_MODEL_FORMAT"
+  fi
   if [[ -n "$CLI_WYOMING_PIPER_HOST" ]]; then
     WYOMING_PIPER_HOST="$CLI_WYOMING_PIPER_HOST"
   fi
@@ -586,7 +610,6 @@ main() {
 
   require_cmd bash
   require_cmd python3
-  require_cmd timeout
 
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -633,13 +656,22 @@ main() {
   custom_models_dir="$(expand_tilde "$custom_models_dir")"
   data_dir="$(expand_tilde "$data_dir")"
 
+  # If the repo path contains a stub openWakeWord checkout, switch to a real clone.
+  local stub_train_py="$repo_dir/openwakeword/train.py"
+  if [[ -f "$stub_train_py" ]] \
+    && grep -Eqi "stub openwakeword|dummy model|simulated" "$stub_train_py"; then
+    log "Detected stub openWakeWord checkout at $repo_dir."
+    local upstream_repo_dir="$base_dir/openWakeWord_upstream"
+    repo_dir="$upstream_repo_dir"
+  fi
+
   validate_base_dir "$base_dir"
   mkdir -p "$base_dir" "$runs_dir" "$logs_dir" "$custom_models_dir" "$data_dir"
   require_free_disk_gb "$base_dir" "${MIN_FREE_DISK_GB:-8}"
 
   local apt_stamp="$logs_dir/.apt_updated"
   if command -v apt-get >/dev/null 2>&1; then
-    # Core tooling
+    # Core tooling (Debian/Ubuntu/Raspbian)
     local -a req_pkgs=(
       ca-certificates
       curl
@@ -659,61 +691,25 @@ main() {
       libssl-dev
       jq
     )
-
-    # "As many python packages as possible" via apt (optional if available)
-    local -a opt_py_pkgs=(
-      python3-numpy
-      python3-scipy
-      python3-yaml
-      python3-soundfile
-    )
-
-    # Optional, may or may not exist on your distro/repo:
-    local -a maybe_pkgs=(
-      libspeexdsp-dev
-      python3-torch
-      python3-torchaudio
-      python3-onnxruntime
-    )
-
     local -a to_install=()
     for p in "${req_pkgs[@]}"; do
-      if ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
+      if ! dpkg -s "$p" >/dev/null 2>&1; then to_install+=("$p"); fi
     done
     if [[ ${#to_install[@]} -gt 0 ]]; then
       apt_update_once "$apt_stamp"
-    fi
-    if [[ ${#to_install[@]} -gt 0 ]]; then
-      log "Installing required apt packages..."
       apt_install_many "${to_install[@]}"
-    else
-      log "Required apt packages already installed."
     fi
-
-    if [[ "${INSTALL_OPTIONAL_APT:-1}" == "1" ]]; then
-      apt_update_once "$apt_stamp"
-      to_install=()
-      for p in "${opt_py_pkgs[@]}"; do
-        if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
-      done
-      if [[ ${#to_install[@]} -gt 0 ]]; then
-        log "Installing optional python-related apt packages (speed/compat on Pi)..."
-        apt_install_many "${to_install[@]}"
+  elif [[ "$(uname)" == "Darwin" ]]; then
+    log "Detected macOS. Using Homebrew for system dependencies."
+    for pkg in ffmpeg sox libsndfile jq tmux git; do
+      if ! command -v "$pkg" >/dev/null 2>&1; then
+        log "Installing $pkg via Homebrew..."
+        brew install "$pkg" || log "WARNING: Homebrew install failed for $pkg."
       fi
-
-      to_install=()
-      for p in "${maybe_pkgs[@]}"; do
-        if apt_pkg_available "$p" && ! apt_pkg_installed "$p"; then to_install+=("$p"); fi
-      done
-      if [[ ${#to_install[@]} -gt 0 ]]; then
-        log "Installing additional optional apt packages that are available on this OS..."
-        apt_install_many "${to_install[@]}"
-      fi
-    else
-      log "Skipping optional apt packages (INSTALL_OPTIONAL_APT=0)."
-    fi
+    done
+    log "macOS system dependencies handled. Using Python packages for all other dependencies."
   else
-    die "apt-get not found. This script currently targets Debian/Raspberry Pi OS/Ubuntu."
+    log "Non-Debian, non-macOS platform detected. Skipping system package install. Using Python packages for all dependencies."
   fi
 
   require_cmd git
@@ -729,6 +725,8 @@ main() {
     else
       log "No DNS resolution detected; skipping repo update."
     fi
+  elif [[ -d "$repo_dir/openwakeword" ]]; then
+    log "Local openWakeWord source found at $repo_dir; skipping git clone."
   else
     have_internet_dns || die "No DNS resolution detected; cannot clone repos. Fix networking or pre-clone openWakeWord into $repo_dir."
     log "Cloning openWakeWord into $repo_dir ..."
@@ -736,16 +734,35 @@ main() {
       || die "git clone failed."
   fi
 
-  # Create venv (use system site packages to leverage apt-installed numpy/scipy on Pi)
-  if [[ -d "$venv_dir" ]]; then
-    log "Venv already exists: $venv_dir"
+  # Ensure venv exists and activate it (preferred: reuse existing venv to avoid permission issues)
+  if [[ -f "$venv_dir/bin/activate" ]]; then
+    log "Using existing venv: $venv_dir"
   else
     log "Creating venv: $venv_dir"
-    python3 -m venv --system-site-packages "$venv_dir" || die "venv creation failed."
+    venv_attempts=0
+    until python3 -m venv "$venv_dir"; do
+      venv_attempts=$((venv_attempts+1))
+      log "venv creation failed, retrying ($venv_attempts)..."
+      sleep 2
+      if [[ $venv_attempts -ge 3 ]]; then
+        die "venv creation failed after 3 attempts."
+      fi
+    done
   fi
-
   # shellcheck disable=SC1091
   source "$venv_dir/bin/activate"
+
+  # Upgrade pip/setuptools/wheel with retries
+  pip_attempts=0
+  until PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
+    python -m pip install -U --no-input --disable-pip-version-check pip setuptools wheel; do
+    pip_attempts=$((pip_attempts+1))
+    log "pip bootstrap/upgrade failed, retrying ($pip_attempts)..."
+    sleep 2
+    if [[ $pip_attempts -ge 3 ]]; then
+      die "pip bootstrap/upgrade failed after 3 attempts."
+    fi
+  done
   PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
     python -m pip install -U --no-input --disable-pip-version-check pip setuptools wheel \
     || die "pip bootstrap/upgrade failed."
@@ -772,7 +789,15 @@ main() {
   else
     pip_pkgs+=(piper-tts)
   fi
-  pip_install "${pip_pkgs[@]}"
+  pip_pkgs_install_attempts=0
+  until pip_install "${pip_pkgs[@]}"; do
+    pip_pkgs_install_attempts=$((pip_pkgs_install_attempts+1))
+    log "pip install of training packages failed, retrying ($pip_pkgs_install_attempts)..."
+    sleep 2
+    if [[ $pip_pkgs_install_attempts -ge 3 ]]; then
+      die "pip install of training packages failed after 3 attempts."
+    fi
+  done
 
   # Try to ensure torch exists (training often needs it; if your distro provided python3-torch, this may already pass)
   if ! python_import_check torch >/dev/null 2>&1; then
@@ -788,6 +813,12 @@ main() {
     && python_import_check openwakeword >/dev/null 2>&1; then
     skip_openwakeword_install=1
     log "Wyoming openwakeword detected and openwakeword importable; skipping editable install."
+  fi
+  # If a local checkout of openWakeWord exists in the repo dir, prefer it (offline-friendly)
+  if [[ -d "$repo_dir/openwakeword" ]]; then
+    skip_openwakeword_install=1
+    export PYTHONPATH="$repo_dir:${PYTHONPATH:-}"
+    log "Found local openwakeword package in $repo_dir; skipping pip editable install and using local source."
   fi
 
   if [[ "$skip_openwakeword_install" -eq 0 ]]; then
@@ -824,6 +855,9 @@ PY
 )"
   prompt_nonempty train_threads "CPU threads to use" "$default_threads"
   [[ "$train_threads" =~ ^[0-9]+$ ]] || die "TRAIN_THREADS must be an integer."
+
+  local model_format="${MODEL_FORMAT:-}"
+  prompt_choice model_format "Model format" "both" "tflite" "onnx" "both"
 
   local run_id
   run_id="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -914,13 +948,14 @@ trap 'die "Unhandled error at line \$LINENO."' ERR
 
 VENV_DIR="${venv_dir}"
 REPO_DIR="${repo_dir}"
-RUN_DIR="${run_dir}"
-CFG_PATH="${cfg_out}"
-CUSTOM_MODELS_DIR="${custom_models_dir}"
-TRAIN_THREADS="${train_threads}"
-DATA_DIR="${data_dir}"
-DATASET_DIR="${dataset_dir}"
-DATASET_JSON="${dataset_json}"
+export RUN_DIR="${run_dir}"
+export CFG_PATH="${cfg_out}"
+export CUSTOM_MODELS_DIR="${custom_models_dir}"
+export TRAIN_THREADS="${train_threads}"
+export MODEL_FORMAT="${model_format}"
+export DATA_DIR="${data_dir}"
+export DATASET_DIR="${dataset_dir}"
+export DATASET_JSON="${dataset_json}"
 GENERATE_DATASET="${script_dir}/generate_dataset.py"
 POSITIVE_SOURCES="${POSITIVE_SOURCES:-}"
 NEGATIVE_SOURCES="${NEGATIVE_SOURCES:-}"
@@ -975,6 +1010,20 @@ python openwakeword/train.py --training_config "\$CFG_PATH" --train_model 2>&1 |
 log "Training finished; searching for newly produced model artifacts..."
 mapfile -t tflites < <(find "\$RUN_DIR" "\$REPO_DIR" -type f -name "*.tflite" -newer "\$RUN_DIR/.start_time" 2>/dev/null | sort || true)
 mapfile -t onnxes  < <(find "\$RUN_DIR" "\$REPO_DIR" -type f -name "*.onnx"  -newer "\$RUN_DIR/.start_time" 2>/dev/null | sort || true)
+
+case "\${MODEL_FORMAT:-both}" in
+  tflite)
+    onnxes=()
+    ;;
+  onnx)
+    tflites=()
+    ;;
+  both)
+    ;;
+  *)
+    log "WARNING: Unknown MODEL_FORMAT='\${MODEL_FORMAT}'. Copying all formats."
+    ;;
+esac
 
 if [[ \${#tflites[@]} -eq 0 && \${#onnxes[@]} -eq 0 ]]; then
   log "WARNING: No new .tflite/.onnx files found. Check \$RUN_DIR/training.log for where outputs were written."

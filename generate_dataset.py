@@ -44,6 +44,12 @@ def distribute_diverse(
     if not sources:
         return []
 
+    if max_total is not None:
+        max_per_source_min = max_total // len(sources)
+        effective_min = min(min_per_source, max_per_source_min)
+    else:
+        effective_min = min_per_source
+
     per_source_files = {}
     for source in sources:
         files = list(collected[source])
@@ -52,10 +58,10 @@ def distribute_diverse(
 
     selection: list[str] = []
     for source in sources:
-        if min_per_source <= 0:
+        if effective_min <= 0:
             continue
         files = per_source_files[source]
-        take = min(min_per_source, len(files))
+        take = min(effective_min, len(files))
         selection.extend(files[:take])
         per_source_files[source] = files[take:]
 
