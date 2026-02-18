@@ -8,13 +8,16 @@ import json
 VENV_DIR = os.path.join(os.path.dirname(__file__), ".venv")
 try:
     from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-except ImportError:
-    # Attempt to install Flask into the active interpreter (useful when running inside the venv)
-    try:
+except ImportError as exc:
+    in_venv = getattr(sys, "prefix", "") != getattr(sys, "base_prefix", "")
+    if in_venv:
         subprocess.run([sys.executable, "-m", "pip", "install", "flask"], check=True)
         from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-    except Exception:
-        raise
+    else:
+        raise RuntimeError(
+            "Flask is not installed in the active interpreter. "
+            "Run via 'bash orchestrate.sh' (which creates .venv) or activate a venv first."
+        ) from exc
 
 APP_DIR = os.path.dirname(__file__)
 VENV_DIR = os.path.join(APP_DIR, ".venv")
@@ -99,6 +102,8 @@ DEFAULT_PRESET_ID = "m"
 app = Flask(__name__)
 proc = None
 current_run_dir = None
+last_exit_code = None
+proc_lock = threading.Lock()
 
 INDEX_HTML = f"""
 <!doctype html>
@@ -258,17 +263,17 @@ function updateSampleDetails() {{
         sampleDetails.textContent = '';
         return;
     }}
-    sampleDetails.textContent = `Approx speed: ${preset.approx}. Samples: ${preset.samples}. Min per source: ${preset.min_per_source}.`;
+    sampleDetails.textContent = `Approx speed: ${{preset.approx}}. Samples: ${{preset.samples}}. Min per source: ${{preset.min_per_source}}.`;
 }}
 
 samplePresetSelect.addEventListener('change', updateSampleDetails);
 setSamplePresets();
 
-function fetchLog(){
+function fetchLog(){{
   fetch('/log')
     .then(r=>r.json())
-    .then(j=>{ document.getElementById('log').textContent = j.log; });
-}
+    .then(j=>{{ document.getElementById('log').textContent = j.log; }});
+}}
 setInterval(fetchLog, 2000);
 </script>
 """
@@ -279,9 +284,13 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start():
-    global proc, current_run_dir
-    if proc and proc.poll() is None:
-        return "Training already running", 409
+    global proc, current_run_dir, last_exit_code
+    with proc_lock:
+        if proc and proc.poll() is None:
+            return "Training already running", 409
+        proc = None
+        current_run_dir = None
+        last_exit_code = None
 
     wake_phrase = request.form.get('wake_phrase', 'hey assistant')
     device_id = request.form.get('device_id', 'custom_manual')
@@ -350,11 +359,26 @@ def start():
     logs_dir = os.path.join(BASE_DIR, 'logs')
     os.makedirs(logs_dir, exist_ok=True)
     out_log = os.path.join(logs_dir, 'trainer_cli.log')
+    with open(out_log, 'ab') as f:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        f.write(f"\n[{stamp}] [wakeword_web] starting run: wake_phrase={wake_phrase!r} profile={profile} format={model_format} threads={threads}\n".encode("utf-8"))
 
     def run_trainer():
         nonlocal cmd, env, out_log
+        global proc, last_exit_code
+        exit_code = -1
+        process = None
         with open(out_log, 'ab') as f:
-            subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT)
+            try:
+                process = subprocess.Popen(cmd, env=env, stdout=f, stderr=subprocess.STDOUT)
+                with proc_lock:
+                    proc = process
+                exit_code = process.wait()
+            finally:
+                with proc_lock:
+                    if proc is process:
+                        proc = None
+                    last_exit_code = exit_code
 
     t = threading.Thread(target=run_trainer, daemon=True)
     t.start()
@@ -387,15 +411,25 @@ def start():
 
 @app.route('/log')
 def log():
+    with proc_lock:
+        is_running = bool(proc and proc.poll() is None)
+        exit_code = last_exit_code
+
     if not current_run_dir:
         # Fallback to CLI-captured trainer output
         out_log = os.path.join(BASE_DIR, 'logs', 'trainer_cli.log')
         if os.path.exists(out_log):
             try:
                 with open(out_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    return jsonify(log=f.read()[-20000:])
+                    data = f.read()[-20000:]
+                    status = "Training running..." if is_running else (
+                        f"Last run exit code: {exit_code}" if exit_code is not None else "No run started yet."
+                    )
+                    return jsonify(log=f"{status}\n\n{data}")
             except Exception as e:
                 return jsonify(log=f'Error reading fallback log: {e}')
+        if exit_code is not None:
+            return jsonify(log=f'Last run exit code: {exit_code}')
         return jsonify(log='No run started yet.')
 
     log_path = os.path.join(current_run_dir, 'training.log')
@@ -405,7 +439,11 @@ def log():
         if os.path.exists(out_log):
             try:
                 with open(out_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    return jsonify(log=f.read()[-20000:])
+                    data = f.read()[-20000:]
+                    status = "Training running..." if is_running else (
+                        f"Last run exit code: {exit_code}" if exit_code is not None else "Waiting for log..."
+                    )
+                    return jsonify(log=f"{status}\n\n{data}")
             except Exception as e:
                 return jsonify(log=f'Error reading fallback log: {e}')
         return jsonify(log='Log not yet created. Waiting...')
@@ -413,7 +451,10 @@ def log():
     try:
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             data = f.read()[-20000:]
-        return jsonify(log=data)
+        status = "Training running..." if is_running else (
+            f"Last run exit code: {exit_code}" if exit_code is not None else "Training status unknown."
+        )
+        return jsonify(log=f"{status}\n\n{data}")
     except Exception as e:
         return jsonify(log=f'Error reading log: {e}')
 

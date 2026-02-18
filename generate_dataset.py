@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import random
+from collections import deque
 from pathlib import Path
 
 
@@ -50,11 +51,11 @@ def distribute_diverse(
     else:
         effective_min = min_per_source
 
-    per_source_files = {}
+    per_source_files: dict[str, deque[str]] = {}
     for source in sources:
         files = list(collected[source])
         rng.shuffle(files)
-        per_source_files[source] = files
+        per_source_files[source] = deque(files)
 
     selection: list[str] = []
     for source in sources:
@@ -62,8 +63,8 @@ def distribute_diverse(
             continue
         files = per_source_files[source]
         take = min(effective_min, len(files))
-        selection.extend(files[:take])
-        per_source_files[source] = files[take:]
+        for _ in range(take):
+            selection.append(files.popleft())
 
     if max_total is not None:
         remaining_slots = max(0, max_total - len(selection))
@@ -80,7 +81,7 @@ def distribute_diverse(
             files = per_source_files[source]
             if not files:
                 continue
-            selection.append(files.pop(0))
+            selection.append(files.popleft())
             made_progress = True
             if remaining_slots is not None:
                 remaining_slots -= 1

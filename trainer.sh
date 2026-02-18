@@ -662,32 +662,15 @@ main() {
 
   # If the repo path contains a stub openWakeWord checkout, switch to a real clone.
   local stub_train_py="$repo_dir/openwakeword/train.py"
-  log "DEBUG: Checking stub at $stub_train_py (file exists: $([[ -f "$stub_train_py" ]] && echo yes || echo no))"
-  
   local is_stub=0
-  if [[ -f "$stub_train_py" ]]; then
-    log "DEBUG: File exists, checking grep..."
-    # Explicitly test each pattern
-    if grep -qi "stub openwakeword" "$stub_train_py" 2>/dev/null; then
-      log "DEBUG: Found 'stub openwakeword'"
-      is_stub=1
-    elif grep -qi "dummy model" "$stub_train_py" 2>/dev/null; then
-      log "DEBUG: Found 'dummy model'"
-      is_stub=1
-    elif grep -qi "simulated" "$stub_train_py" 2>/dev/null; then
-      log "DEBUG: Found 'simulated'"
-      is_stub=1
-    else
-      log "DEBUG: No stub markers found"
-    fi
+  if [[ -f "$stub_train_py" ]] && grep -Eqi "stub openwakeword|dummy model|simulated" "$stub_train_py" 2>/dev/null; then
+    is_stub=1
   fi
-  
-  log "DEBUG: is_stub=$is_stub"
+
   if [[ $is_stub -eq 1 ]]; then
     log "Detected stub openWakeWord checkout at $repo_dir."
     local upstream_repo_dir="$base_dir/openWakeWord_upstream"
     repo_dir="$upstream_repo_dir"
-    log "DEBUG: Switched repo_dir to $repo_dir"
   fi
 
   validate_base_dir "$base_dir"
@@ -793,9 +776,6 @@ main() {
       die "pip bootstrap/upgrade failed after 3 attempts."
     fi
   done
-  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
-    python -m pip install -U --no-input --disable-pip-version-check pip setuptools wheel \
-    || die "pip bootstrap/upgrade failed."
 
   # Install baseline Python deps (best-effort superset for training flows)
   log "Installing Python packages (best-effort superset for openWakeWord training + Piper dataset gen)..."

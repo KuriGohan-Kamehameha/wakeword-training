@@ -19,8 +19,8 @@ def gen_silence(filepath, duration=2.0):
     try:
         subprocess.run([
             "ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono",
-            "-t", str(duration), "-q:a", "9", "-acodec", "libmp3lame",
-            "-y", filepath
+            "-t", str(duration), "-ar", "22050", "-ac", "1",
+            "-c:a", "pcm_s16le", "-y", filepath
         ], capture_output=True, timeout=15, check=True)
         return True
     except Exception as e:
