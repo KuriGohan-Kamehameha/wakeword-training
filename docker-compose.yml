@@ -1,0 +1,119 @@
+services:
+  # Wyoming Piper TTS service
+  piper:
+    image: rhasspy/wyoming-piper:latest
+    container_name: wakeword-piper
+    restart: unless-stopped
+    ports:
+      - "10200:10200"
+    volumes:
+      - piper-data:/data
+    command: >
+      --voice en_US-lessac-medium
+      --data-dir /data
+      --uri tcp://0.0.0.0:10200
+    networks:
+      - wakeword-net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s = socket.socket(); s.connect(('127.0.0.1', 10200)); s.close()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Wyoming openWakeWord service
+  openwakeword:
+    image: rhasspy/wyoming-openwakeword:latest
+    container_name: wakeword-openwakeword
+    restart: unless-stopped
+    ports:
+      - "10400:10400"
+    volumes:
+      - openwakeword-data:/data
+      - ./wakeword_lab/custom_models:/custom-models:ro
+    command: >
+      --uri tcp://0.0.0.0:10400
+      --custom-model-dir /custom-models
+      --preload-model alexa
+    networks:
+      - wakeword-net
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s = socket.socket(); s.connect(('127.0.0.1', 10400)); s.close()\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Training environment
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wakeword-trainer
+    stdin_open: true
+    tty: true
+    environment:
+      - WYOMING_PIPER_HOST=piper
+      - WYOMING_PIPER_PORT=10200
+      - WYOMING_OPENWAKEWORD_HOST=openwakeword
+      - WYOMING_OPENWAKEWORD_PORT=10400
+      - BASE_DIR=/workspace
+      - ALLOW_LOW_DISK=1
+      - PYTHONUNBUFFERED=1
+      - TRAIN_NOW=${TRAIN_NOW:-}
+      - TRAIN_PROFILE=${TRAIN_PROFILE:-medium}
+      - TRAIN_THREADS=${TRAIN_THREADS:-2}
+      - MODEL_FORMAT=${MODEL_FORMAT:-tflite}
+    volumes:
+      - ./:/app:ro
+      - training-workspace:/workspace
+      - ./wakeword_lab/custom_models:/workspace/custom_models
+      - ./wakeword_lab/data:/workspace/data
+    working_dir: /app
+    networks:
+      - wakeword-net
+    depends_on:
+      piper:
+        condition: service_healthy
+      openwakeword:
+        condition: service_healthy
+
+  # Web wizard
+  web-wizard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wakeword-web-wizard
+    ports:
+      - "5000:5000"
+    environment:
+      - WYOMING_PIPER_HOST=piper
+      - WYOMING_PIPER_PORT=10200
+      - WYOMING_OPENWAKEWORD_HOST=openwakeword
+      - WYOMING_OPENWAKEWORD_PORT=10400
+      - BASE_DIR=/workspace
+      - ALLOW_LOW_DISK=1
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/app:ro
+      - training-workspace:/workspace
+      - ./wakeword_lab/custom_models:/workspace/custom_models
+      - ./wakeword_lab/data:/workspace/data
+    working_dir: /app
+    networks:
+      - wakeword-net
+    depends_on:
+      piper:
+        condition: service_healthy
+      openwakeword:
+        condition: service_healthy
+    command: python wakeword_web.py
+    profiles:
+      - web  # Only start with --project-name or when explicitly enabled
+
+networks:
+  wakeword-net:
+    driver: bridge
+
+volumes:
+  piper-data:
+  openwakeword-data:
+  training-workspace:

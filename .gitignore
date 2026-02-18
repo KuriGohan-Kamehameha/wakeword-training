@@ -205,3 +205,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# WakeWord Training Project
+.DS_Store
+wakeword_lab/venv/
+wakeword_lab/data/positives/*.wav
+wakeword_lab/data/negatives/*.wav
+wakeword_lab/logs/
+wakeword_lab/training_runs/
+**/dummy_model.tflite
+
+# Docker volumes and build artifacts
+piper-data/
+openwakeword-data/
+training-workspace/
+wakeword_lab/openWakeWord/

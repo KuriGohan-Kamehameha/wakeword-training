@@ -1,0 +1,30 @@
+{
+  "wake_word": "Geronimo",
+  "created": "2026-02-18",
+  "models": [
+    {
+      "file": "geronimo_xvf3800.onnx",
+      "device": "ReSpeaker XVF3800",
+      "format": "onnx",
+      "profile": "tiny",
+      "trained": true,
+      "size_kb": 8.5068359375
+    },
+    {
+      "file": "geronimo_vector.onnx",
+      "device": "Anki Vector (wire-pod)",
+      "format": "onnx",
+      "profile": "tiny",
+      "trained": true,
+      "size_kb": 8.5048828125
+    },
+    {
+      "file": "geronimo_atom_echo.onnx",
+      "device": "Atom Echo",
+      "format": "onnx",
+      "profile": "tiny",
+      "trained": true,
+      "size_kb": 8.5107421875
+    }
+  ]
+}
