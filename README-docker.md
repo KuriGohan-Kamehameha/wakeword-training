@@ -42,15 +42,10 @@ PowerShell equivalent:
   --negatives 240
 ```
 
-Generated positives are stored per wakeword in `wakeword_lab/data/positives/<wakeword_slug>/` and use highest-quality available local TTS voices (novelty voices excluded) plus speech variants.
+Generated positives are stored per wakeword in `wakeword_lab/data/positives/<wakeword_slug>/` and use highest-quality available Piper voices plus speech variants.
 Generated negatives are pooled in `wakeword_lab/data/negatives/`, append-only, and include both non-speech and speech (diverse voices + diverse non-wake phrases).
 
-Host prerequisites for `--generate-samples`:
-
-- `ffmpeg`
-- local TTS backend (`espeak-ng`/`espeak` on Linux, `say` on macOS, or Windows PowerShell speech synthesis)
-
-The generator replaces previous positives only for the current wakeword folder, and appends only new uniquely indexed negatives.
+The generator appends only unique clips and does not discard previous data.
 Each run adds at least 50 new negatives, even if `--negatives` is set lower.
 
 ## Stability/performance guards
@@ -80,9 +75,9 @@ docker compose down
 
 ## Outputs
 
-- Models: `wakeword_lab/custom_models/`
+- Models: `wakeword_lab/data/custom_models/`
 - Input data: `wakeword_lab/data/positives/` and `wakeword_lab/data/negatives/`
-- Training runs/logs: Docker volume `training-workspace` (`/workspace/training_runs` in container)
+- Training runs/logs: `wakeword_lab/data/training_runs/` and `wakeword_lab/data/logs/`
 
 ## Troubleshooting
 

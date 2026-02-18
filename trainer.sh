@@ -697,8 +697,9 @@ PY
   if [[ -d "$scoped_positive_dir" ]] && find "$scoped_positive_dir" -maxdepth 1 -type f | grep -q .; then
     default_positive_sources="$scoped_positive_dir"
   fi
+  local default_hard_negative_sources="$data_dir/hard_negatives"
   local positive_sources="${POSITIVE_SOURCES:-$default_positive_sources}"
-  local negative_sources="${NEGATIVE_SOURCES:-$normalized_negative_dir}"
+  local negative_sources="${NEGATIVE_SOURCES:-$normalized_negative_dir,$default_hard_negative_sources}"
   local max_positive="${MAX_POSITIVE_SAMPLES:-$default_max_positive}"
   local max_negative="${MAX_NEGATIVE_SAMPLES:-}"
   local min_per_source="${MIN_PER_SOURCE:-3}"
@@ -919,6 +920,41 @@ PY
     cp -f "$f" "$custom_models_dir/"
     log "Copied artifact: $f -> $custom_models_dir/"
   done
+
+  local eval_model=""
+  if [[ ${#tflites[@]} -gt 0 ]]; then
+    eval_model="${tflites[0]}"
+  elif [[ ${#onnxes[@]} -gt 0 ]]; then
+    eval_model="${onnxes[0]}"
+  fi
+
+  local closed_loop_eval="$script_dir/closed_loop_eval.py"
+  if [[ -n "$eval_model" && -f "$closed_loop_eval" ]]; then
+    local feature_dir="$run_dir/$model_slug"
+    local eval_pos_dir="$feature_dir/positive_test"
+    local eval_neg_dir="$feature_dir/negative_test"
+    local eval_report="$run_dir/evaluation/closed_loop_report.json"
+    local hard_neg_dir="$data_dir/hard_negatives/$model_slug"
+    local target_far_per_hour="${TARGET_FALSE_ALARMS_PER_HOUR:-0.1}"
+    local closed_loop_max_clips="${CLOSED_LOOP_MAX_CLIPS:-600}"
+    local max_mined_hard_negatives="${MAX_MINED_HARD_NEGATIVES:-200}"
+    mkdir -p "$(dirname "$eval_report")" "$hard_neg_dir"
+    if [[ -d "$eval_pos_dir" && -d "$eval_neg_dir" ]]; then
+      log "Running closed-loop evaluation + hard-negative mining"
+      python3 "$closed_loop_eval" \
+        --model-path "$eval_model" \
+        --positives-dir "$eval_pos_dir" \
+        --negatives-dir "$eval_neg_dir" \
+        --target-far-per-hour "$target_far_per_hour" \
+        --max-clips "$closed_loop_max_clips" \
+        --hard-negatives-dir "$hard_neg_dir" \
+        --max-mined "$max_mined_hard_negatives" \
+        --report-path "$eval_report" \
+        || log "WARNING: closed-loop evaluation failed; continuing."
+    else
+      log "WARNING: Skipping closed-loop eval (missing clip dirs: $eval_pos_dir / $eval_neg_dir)"
+    fi
+  fi
 
   echo
   echo "=== COMPLETE ==="

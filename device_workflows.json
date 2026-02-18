@@ -8,9 +8,9 @@
     "profile": "medium",
     "max_filesize_kb": 200,
     "threads": 1,
-    "piper_host": "kulfi.local",
+    "piper_host": "piper",
     "piper_port": 10200,
-    "oww_host": "kulfi.local",
+    "oww_host": "openwakeword",
     "oww_port": 10400,
     "notes": "Generic output. Override format/profile as needed."
   },

@@ -7,9 +7,9 @@ services:
     ports:
       - "10200:10200"
     volumes:
-      - piper-data:/data
+      - ./wakeword_lab/data/services/piper:/data
     command: >
-      --voice en_US-lessac-medium
+      --voice en_US-lessac-high
       --data-dir /data
       --uri tcp://0.0.0.0:10200
     networks:
@@ -28,8 +28,8 @@ services:
     ports:
       - "10400:10400"
     volumes:
-      - openwakeword-data:/data
-      - ./wakeword_lab/custom_models:/custom-models:ro
+      - ./wakeword_lab/data/services/openwakeword:/data
+      - ./wakeword_lab/data/custom_models:/custom-models:ro
     command: >
       --uri tcp://0.0.0.0:10400
       --custom-model-dir /custom-models
@@ -55,7 +55,7 @@ services:
       - WYOMING_PIPER_PORT=10200
       - WYOMING_OPENWAKEWORD_HOST=openwakeword
       - WYOMING_OPENWAKEWORD_PORT=10400
-      - BASE_DIR=/workspace
+      - BASE_DIR=/workspace/data
       - ALLOW_LOW_DISK=1
       - PYTHONUNBUFFERED=1
       - TRAIN_PROFILE=${TRAIN_PROFILE:-medium}
@@ -63,8 +63,6 @@ services:
       - MODEL_FORMAT=${MODEL_FORMAT:-tflite}
     volumes:
       - ./:/app:ro
-      - training-workspace:/workspace
-      - ./wakeword_lab/custom_models:/workspace/custom_models
       - ./wakeword_lab/data:/workspace/data
     working_dir: /app
     networks:
@@ -88,13 +86,11 @@ services:
       - WYOMING_PIPER_PORT=10200
       - WYOMING_OPENWAKEWORD_HOST=openwakeword
       - WYOMING_OPENWAKEWORD_PORT=10400
-      - BASE_DIR=/workspace
+      - BASE_DIR=/workspace/data
       - ALLOW_LOW_DISK=1
       - PYTHONUNBUFFERED=1
     volumes:
       - ./:/app:ro
-      - training-workspace:/workspace
-      - ./wakeword_lab/custom_models:/workspace/custom_models
       - ./wakeword_lab/data:/workspace/data
     working_dir: /app
     networks:
@@ -111,8 +107,3 @@ services:
 networks:
   wakeword-net:
     driver: bridge
-
-volumes:
-  piper-data:
-  openwakeword-data:
-  training-workspace:

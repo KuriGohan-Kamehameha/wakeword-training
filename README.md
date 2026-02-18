@@ -12,11 +12,6 @@ Docker-first wakeword training for openWakeWord, with an end-to-end workflow tha
 
 - Docker Desktop (Windows/macOS) or Docker Engine + Compose plugin (Linux)
 - Running Docker daemon
-- `ffmpeg` on host if using `--generate-samples`
-- Local TTS backend on host for spoken positives when using `--generate-samples`:
-  - Linux: `espeak-ng` or `espeak`
-  - macOS: `say` (built in)
-  - Windows: PowerShell speech synthesis (`System.Speech`)
 
 ## Quick start
 
@@ -35,14 +30,14 @@ Docker-first wakeword training for openWakeWord, with an end-to-end workflow tha
 
 Artifacts are written to:
 
-- `wakeword_lab/custom_models/`
+- `wakeword_lab/data/custom_models/`
 
 ## Sample diversity
 
 If you use `--generate-samples`, the generator now creates:
 
 - positives in a wakeword-specific folder: `wakeword_lab/data/positives/<wakeword_slug>/`
-  - spoken wake phrase with highest-quality available local TTS voices (novelty voices excluded) plus speech variants (`clean`, `fast`, `slow`, `telephone`, `quiet`, `loud`, `bright`)
+  - spoken wake phrase with highest-quality available Piper voices plus speech variants (`clean`, `fast`, `slow`, `telephone`, `quiet`, `loud`, `bright`)
 - negatives in a pooled folder: `wakeword_lab/data/negatives/`
   - appends only new uniquely indexed clips (no overwriting existing negatives)
   - adds at least 50 new negatives per generation run
@@ -54,7 +49,7 @@ To regenerate local sample data:
 ./docker-train.sh --wake-phrase "Theodora" --generate-samples --positives 240 --negatives 240
 ```
 
-Each generation run replaces prior positives only for the current wakeword folder, while `negative_*.wav` files are append-only and indexed so each run contributes unique negatives without duplicating existing filenames.
+Each generation run appends only unique files and does not discard prior samples.
 
 ## Recommended device settings
 
@@ -81,6 +76,8 @@ Each generation run replaces prior positives only for the current wakeword folde
 
 - `wakeword_lab/data/positives/<wakeword_slug>/`: wakeword-specific positive audio clips
 - `wakeword_lab/data/negatives/`: negative audio clips
-- `wakeword_lab/custom_models/`: exported model artifacts
+- `wakeword_lab/data/hard_negatives/`: mined hard negatives from false activations
+- `wakeword_lab/data/custom_models/`: exported model artifacts
+- `wakeword_lab/data/training_runs/`: run artifacts and logs
 
 For more operational detail, see `README-docker.md`.

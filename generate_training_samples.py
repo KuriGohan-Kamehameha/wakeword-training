@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Generate diverse training audio samples for wake word detection."""
+"""Generate diverse training audio samples for wake word detection using Piper voices only."""
 import argparse
+import json
 import os
 import re
 import shutil
@@ -8,12 +9,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 from collections import Counter
 from pathlib import Path
+from urllib.request import urlopen
+
+from piper.config import SynthesisConfig
+from piper.download_voices import VOICES_JSON, download_voice
+from piper.voice import PiperVoice
 
 
 def log(msg):
-    """Log with timestamp."""
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"[{ts}] [generate_samples] {msg}", file=sys.stderr)
 
@@ -92,196 +98,143 @@ NEGATIVE_SPOKEN_PHRASES = [
 ]
 
 
-def detect_tts_backend():
-    """Pick the best available local TTS backend."""
-    for cmd in ("espeak-ng", "espeak", "say"):
-        if shutil.which(cmd):
-            return cmd
-    if os.name == "nt":
-        for cmd in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
-            if shutil.which(cmd):
-                return cmd
-    return None
+PIPER_PREFERRED_HIGH_QUALITY_VOICES = [
+    "en_US-lessac-high",
+    "en_US-libritts-high",
+    "en_US-ljspeech-high",
+    "en_US-ryan-high",
+    "en_GB-cori-high",
+]
 
 
-def list_tts_voices(backend):
-    """List available voices for the selected backend."""
-    voices = []
+def fetch_piper_voices_index():
+    with urlopen(VOICES_JSON, timeout=30) as response:
+        return json.load(response)
+
+
+def _cached_high_quality_voices(download_dir: Path):
+    cached = []
+    if not download_dir.exists():
+        return cached
+    for voice in PIPER_PREFERRED_HIGH_QUALITY_VOICES:
+        model = download_dir / f"{voice}.onnx"
+        config = download_dir / f"{voice}.onnx.json"
+        if model.exists() and config.exists():
+            cached.append(voice)
+    return cached
+
+
+def resolve_piper_voice_pool(max_voices=8, download_dir: Path | None = None):
+    high_english = []
     try:
-        if backend == "say":
-            out = subprocess.check_output(
-                ["say", "-v", "?"],
-                stderr=subprocess.DEVNULL,
-                timeout=20,
-                text=True,
-            )
-            for line in out.splitlines():
-                left = line.split("#", 1)[0].strip()
-                if not left:
-                    continue
-                cols = re.split(r"\s{2,}", left)
-                if cols:
-                    voice = cols[0].strip()
-                    if voice:
-                        voices.append(voice)
-        elif backend in ("espeak-ng", "espeak"):
-            out = subprocess.check_output(
-                [backend, "--voices"],
-                stderr=subprocess.DEVNULL,
-                timeout=20,
-                text=True,
-            )
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 4 and parts[0].isdigit():
-                    voices.append(parts[3].strip())
-        else:
-            script = (
-                "$ErrorActionPreference='Stop';"
-                "Add-Type -AssemblyName System.Speech;"
-                "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-                "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name };"
-                "$s.Dispose();"
-            )
-            out = subprocess.check_output(
-                [backend, "-NoProfile", "-Command", script],
-                stderr=subprocess.DEVNULL,
-                timeout=20,
-                text=True,
-            )
-            for line in out.splitlines():
-                voice = line.strip()
-                if voice:
-                    voices.append(voice)
-    except Exception:
-        pass
+        voices = fetch_piper_voices_index()
+        for name, meta in voices.items():
+            quality = (meta or {}).get("quality", "")
+            lang_code = ((meta or {}).get("language", {}) or {}).get("code", "")
+            if quality == "high" and str(lang_code).startswith("en_"):
+                high_english.append(name)
+    except Exception as e:
+        log(f"WARNING: failed to fetch Piper voices index; using cached voices only ({e})")
+        if download_dir is not None:
+            high_english = _cached_high_quality_voices(download_dir)
+    if not high_english:
+        return []
 
-    unique = []
-    seen = set()
-    for v in voices:
-        if v not in seen:
-            seen.add(v)
-            unique.append(v)
-    return unique
+    ordered = [v for v in PIPER_PREFERRED_HIGH_QUALITY_VOICES if v in high_english]
+    ordered.extend(v for v in sorted(high_english) if v not in ordered)
+    return ordered[:max_voices]
 
 
-def resolve_tts_voice_pool(backend):
-    """Resolve a stable voice pool with platform-aware preferences."""
-    available = list_tts_voices(backend)
-    pool = []
+class PiperSynthesizer:
+    def __init__(self, voice_pool, download_dir):
+        self.voice_pool = list(voice_pool)
+        self.download_dir = Path(download_dir)
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self._voices = {}
 
-    if backend == "say":
-        novelty = {
-            "bad news",
-            "bahh",
-            "bells",
-            "boing",
-            "bubbles",
-            "cellos",
-            "good news",
-            "jester",
-            "organ",
-            "superstar",
-            "trinoids",
-            "whisper",
-            "wobble",
-            "zarvox",
-            "fred",
-        }
-        candidates = []
-        for v in available:
-            key = v.strip().lower()
-            if key in novelty:
-                continue
-            candidates.append(v)
+    def ensure_voices(self):
+        for voice in self.voice_pool:
+            download_voice(voice, self.download_dir, force_redownload=False)
 
-        preferred = [
-            "Flo (English (US))",
-            "Flo (English (UK))",
-            "Samantha",
-            "Daniel",
-            "Karen",
-            "Moira",
-            "Rishi",
-            "Tessa",
-            "Kathy",
-            "Ralph",
-            "Albert",
-        ]
-        pool = [v for v in preferred if v in candidates]
-        if not pool:
-            # Fallback to non-novelty voices in deterministic order.
-            pool = sorted(candidates)
-        # Keep a compact high-quality subset for consistency.
-        pool = pool[:8]
-    elif backend in ("espeak-ng", "espeak"):
-        preferred = ["en-us", "en", "en-uk", "en-sc", "en+f3", "en+m3", "en+f4", "en+m5"]
-        if available:
-            pool = [v for v in preferred if v in available]
-            if not pool:
-                pool = available[:6]
-        else:
-            pool = preferred[:4]
-    else:
-        preferred = ["Microsoft David Desktop", "Microsoft Zira Desktop", "Microsoft Hazel Desktop"]
-        pool = [v for v in preferred if v in available]
-        if not pool:
-            pool = available[:6]
+    def _load_voice(self, voice_name):
+        voice = self._voices.get(voice_name)
+        if voice is not None:
+            return voice
 
-    if not pool:
-        pool = available[:6]
-    if not pool:
-        pool = [None]
-    return pool
+        model_path = self.download_dir / f"{voice_name}.onnx"
+        config_path = self.download_dir / f"{voice_name}.onnx.json"
+        if not model_path.exists() or not config_path.exists():
+            download_voice(voice_name, self.download_dir, force_redownload=False)
 
+        voice = PiperVoice.load(model_path=model_path, config_path=config_path)
+        self._voices[voice_name] = voice
+        return voice
 
-def purge_generated_wavs(outdir, prefix):
-    """Delete prior generated WAVs for deterministic fresh runs."""
-    removed = 0
-    pattern = f"{prefix}_*.wav"
-    for wav in Path(outdir).glob(pattern):
+    def synthesize_phrase_raw(self, filepath, phrase, idx, voice_name):
         try:
-            wav.unlink()
-            removed += 1
-        except OSError:
-            pass
-    if removed:
-        log(f"  Removed {removed} stale files matching {pattern}")
+            voice = self._load_voice(voice_name)
+            length_scales = [0.95, 1.0, 1.05]
+            noise_scales = [0.55, 0.67, 0.78]
+            noise_w_scales = [0.7, 0.8, 0.9]
+            syn_cfg = SynthesisConfig(
+                length_scale=length_scales[idx % len(length_scales)],
+                noise_scale=noise_scales[(idx // len(length_scales)) % len(noise_scales)],
+                noise_w_scale=noise_w_scales[(idx // (len(length_scales) * len(noise_scales))) % len(noise_w_scales)],
+            )
+            with wave.open(filepath, "wb") as wav_file:
+                voice.synthesize_wav(phrase, wav_file, syn_config=syn_cfg, set_wav_format=True)
+            return True
+        except Exception as e:
+            log(f"ERROR Piper synth voice='{voice_name}': {e}")
+            return False
 
 
-def purge_legacy_flat_positives(data_dir):
-    """Remove old flat positive files so positives remain wakeword-scoped."""
-    legacy_dir = Path(data_dir) / "positives"
-    if not legacy_dir.exists():
-        return 0
-    removed = 0
-    for wav in legacy_dir.glob("positive_*.wav"):
-        try:
-            wav.unlink()
-            removed += 1
-        except OSError:
-            pass
-    return removed
+def _token_is_identifier(token):
+    if not token:
+        return False
+    if token.isdigit():
+        return True
+    if re.fullmatch(r"[0-9a-f]{8,}", token):
+        return True
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", token):
+        return True
+    if re.fullmatch(r"(uid|uuid|id|clip|sample|run|gen)[0-9a-f-]*", token):
+        return True
+    if len(token) >= 6 and re.fullmatch(r"[a-z0-9-]+", token):
+        has_alpha = any(c.isalpha() for c in token)
+        has_digit = any(c.isdigit() for c in token)
+        if has_alpha and has_digit:
+            return True
+    return False
 
 
-def scan_existing_negatives(outdir):
-    """Inspect existing generated negatives and return names, max index, and type counts."""
+def canonical_clip_key(filename, prefix):
+    stem = Path(filename).stem.lower()
+    head = f"{prefix}_"
+    if not stem.startswith(head):
+        return None
+    raw_tokens = [t for t in stem[len(head):].split("_") if t]
+    semantic_tokens = [t for t in raw_tokens if not _token_is_identifier(t)]
+    if not semantic_tokens:
+        return None
+    return f"{prefix}:{'_'.join(semantic_tokens)}"
+
+
+def scan_existing_clips(outdir, prefix):
     existing_names = set()
+    existing_keys = set()
     max_idx = -1
     type_counts = Counter()
-    for wav in Path(outdir).glob("negative_*.wav"):
+    for wav in Path(outdir).glob(f"{prefix}_*.wav"):
         existing_names.add(wav.name)
-        stem = wav.stem
-        parts = stem.split("_")
-        if len(parts) >= 3 and parts[0] == "negative":
-            if parts[1].isdigit():
-                max_idx = max(max_idx, int(parts[1]))
-            type_counts["_".join(parts[2:])] += 1
-    return existing_names, max_idx, type_counts
-
-
-def _ps_quote(value):
-    return value.replace("'", "''")
+        parts = wav.stem.split("_")
+        if len(parts) >= 3 and parts[0] == prefix and parts[1].isdigit():
+            max_idx = max(max_idx, int(parts[1]))
+        key = canonical_clip_key(wav.name, prefix)
+        if key:
+            existing_keys.add(key)
+            type_counts[key.split(":", 1)[1]] += 1
+    return existing_names, max_idx, existing_keys, type_counts
 
 
 def voice_label(value):
@@ -291,52 +244,21 @@ def voice_label(value):
     return text or "voice"
 
 
-def synthesize_phrase_raw(filepath, phrase, backend, idx, voice=None):
-    """Synthesize raw speech to an intermediate file."""
-    try:
-        if backend in ("espeak-ng", "espeak"):
-            rates = [145, 165, 185]
-            pitches = [40, 50, 60]
-            rate = rates[idx % len(rates)]
-            pitch = pitches[(idx // len(rates)) % len(pitches)]
-            cmd = [backend, "-q", "-w", filepath, "-s", str(rate), "-p", str(pitch), phrase]
-            if voice:
-                cmd[1:1] = ["-v", voice]
-        elif backend == "say":
-            rates = [155, 185, 215]
-            rate = rates[idx % len(rates)]
-            cmd = ["say", "-o", filepath, "-r", str(rate), phrase]
-            if voice:
-                cmd[1:1] = ["-v", voice]
-        else:
-            # Windows PowerShell / pwsh with System.Speech.
-            rates = [-2, 0, 2]
-            rate = rates[idx % len(rates)]
-            voice_stmt = ""
-            if voice:
-                voice_stmt = f"try {{$s.SelectVoice('{_ps_quote(voice)}')}} catch {{}};"
-            script = (
-                "$ErrorActionPreference='Stop';"
-                "Add-Type -AssemblyName System.Speech;"
-                "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-                f"$s.Rate={rate};"
-                "$s.Volume=100;"
-                f"{voice_stmt}"
-                f"$s.SetOutputToWaveFile('{_ps_quote(filepath)}');"
-                f"$s.Speak('{_ps_quote(phrase)}');"
-                "$s.Dispose();"
-            )
-            cmd = [backend, "-NoProfile", "-Command", script]
-
-        subprocess.run(cmd, capture_output=True, timeout=40, check=True)
-        return True
-    except Exception as e:
-        log(f"ERROR TTS synth via '{backend}': {e}")
-        return False
+def alpha_token(index):
+    n = int(index)
+    if n < 0:
+        n = 0
+    chars = []
+    while True:
+        n, rem = divmod(n, 26)
+        chars.append(chr(ord("a") + rem))
+        if n == 0:
+            break
+        n -= 1
+    return "".join(reversed(chars))
 
 
 def render_spoken_variant(raw_path, output_path, variant, duration=2.0):
-    """Render a speech variant to canonical mono 22.05k PCM WAV."""
     variant_filters = {
         "clean": "volume=1.0",
         "fast": "atempo=1.08,volume=1.0",
@@ -348,7 +270,6 @@ def render_spoken_variant(raw_path, output_path, variant, duration=2.0):
     }
     af = variant_filters.get(variant, "volume=1.0")
     af = f"{af},apad=pad_dur={duration},atrim=0:{duration}"
-
     try:
         subprocess.run(
             [
@@ -379,12 +300,11 @@ def render_spoken_variant(raw_path, output_path, variant, duration=2.0):
         return False
 
 
-def gen_spoken_positive(phrase, outfile, backend, variant, idx, duration=2.0, voice=None):
-    suffix = ".aiff" if backend == "say" else ".wav"
-    fd, raw_path = tempfile.mkstemp(prefix="wakeword_tts_", suffix=suffix)
+def gen_spoken_positive(phrase, outfile, synthesizer, variant, idx, duration=2.0, voice=None):
+    fd, raw_path = tempfile.mkstemp(prefix="wakeword_tts_", suffix=".wav")
     os.close(fd)
     try:
-        if not synthesize_phrase_raw(raw_path, phrase, backend, idx, voice=voice):
+        if not synthesizer.synthesize_phrase_raw(raw_path, phrase, idx, voice_name=voice):
             return False
         return render_spoken_variant(raw_path, outfile, variant, duration=duration)
     finally:
@@ -395,7 +315,6 @@ def gen_spoken_positive(phrase, outfile, backend, variant, idx, duration=2.0, vo
 
 
 def ffmpeg_lavfi(filepath, lavfi_expr, duration=2.0):
-    """Render a WAV file from a lavfi expression."""
     try:
         subprocess.run(
             [
@@ -433,19 +352,11 @@ def gen_silence(filepath, duration=2.0):
 
 
 def gen_noise(filepath, color, duration=2.0, amplitude=0.05):
-    return ffmpeg_lavfi(
-        filepath,
-        f"anoisesrc=color={color}:amplitude={amplitude}:r=22050",
-        duration,
-    )
+    return ffmpeg_lavfi(filepath, f"anoisesrc=color={color}:amplitude={amplitude}:r=22050", duration)
 
 
 def gen_tone(filepath, frequency=440, duration=2.0, amplitude=0.03):
-    return ffmpeg_lavfi(
-        filepath,
-        f"sine=frequency={frequency}:sample_rate=22050,volume={amplitude}",
-        duration,
-    )
+    return ffmpeg_lavfi(filepath, f"sine=frequency={frequency}:sample_rate=22050,volume={amplitude}", duration)
 
 
 def gen_dual_tone(filepath, duration=2.0, frequency_a=220.0, frequency_b=440.0, amp_a=0.03, amp_b=0.02):
@@ -471,8 +382,7 @@ def pick_negative_phrase(global_index, wake_phrase):
     return phrase
 
 
-def render_negative_variant(kind, outfile, global_index, tts_backend=None, voice_pool=None, wake_phrase=""):
-    """Render a unique negative clip variant for the given running index."""
+def render_negative_variant(kind, outfile, global_index, synthesizer=None, voice_pool=None, wake_phrase=""):
     tier = global_index // 10
     duration = 1.8 + (tier % 5) * 0.1
     amp_jitter = ((tier % 5) - 2) * 0.004
@@ -507,7 +417,7 @@ def render_negative_variant(kind, outfile, global_index, tts_backend=None, voice
             amplitude=max(0.01, 0.02 + amp_jitter / 2),
         )
     if kind.startswith("speech_"):
-        if not tts_backend or not voice_pool:
+        if not synthesizer or not voice_pool:
             return False
         speech_variant = {
             "speech_clean": "clean",
@@ -521,7 +431,7 @@ def render_negative_variant(kind, outfile, global_index, tts_backend=None, voice
         return gen_spoken_positive(
             phrase,
             outfile,
-            tts_backend,
+            synthesizer,
             speech_variant,
             global_index,
             duration=duration,
@@ -530,47 +440,71 @@ def render_negative_variant(kind, outfile, global_index, tts_backend=None, voice
     return False
 
 
-def gen_positives(phrase, outdir, count=50, tts_backend=None, voice_pool=None):
-    """Generate positive training samples (background variations)."""
+def gen_positives(phrase, outdir, count=50, synthesizer=None, voice_pool=None):
     log(f"Generating {count} positive samples for '{phrase}'")
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
-    if not tts_backend:
-        raise RuntimeError("No TTS backend configured for positive sample generation")
+    if not synthesizer:
+        raise RuntimeError("No Piper synthesizer configured for positive sample generation")
     if not voice_pool:
-        raise RuntimeError("No TTS voices available for positive sample generation")
-    log(f"  Voice pool ({len(voice_pool)}) [highest-quality available]: {', '.join([v for v in voice_pool if v])}")
+        raise RuntimeError("No Piper voices available for positive sample generation")
+    log(f"  Voice pool ({len(voice_pool)}) [highest-quality Piper]: {', '.join([v for v in voice_pool if v])}")
     if len([v for v in voice_pool if v]) < 2:
         log("WARNING: less than two voices available; positives may be low-voice-diversity.")
-    purge_generated_wavs(outdir, "positive")
 
-    variations = [
-        "clean",
-        "fast",
-        "slow",
-        "telephone",
-        "quiet",
-        "loud",
-        "bright",
-    ]
+    existing_names, max_existing_idx, existing_keys, existing_type_counts = scan_existing_clips(outdir, "positive")
+    if existing_names:
+        log(f"  Found {len(existing_names)} existing positives (max index {max_existing_idx}); appending unique new samples.")
+    if existing_type_counts:
+        for name in sorted(existing_type_counts):
+            log(f"    existing - {name}: {existing_type_counts[name]}")
+
+    variations = ["clean", "fast", "slow", "telephone", "quiet", "loud", "bright"]
+    voice_count = len(voice_pool)
+    variant_count = len(variations)
 
     generated = 0
     by_type = Counter()
     by_voice = Counter()
-    for i in range(count):
-        name = variations[i % len(variations)]
-        voice = voice_pool[i % len(voice_pool)]
+    next_idx = max(max_existing_idx + 1, 0)
+    semantic_cursor = len(existing_keys)
+    attempts = 0
+    max_attempts = max(count * 40, 100)
+    while generated < count and attempts < max_attempts:
+        attempts += 1
+        voice = voice_pool[semantic_cursor % voice_count]
+        name = variations[(semantic_cursor // voice_count) % variant_count]
+        style_tag = f"style{alpha_token((semantic_cursor // (voice_count * variant_count)))}"
         voice_tag = voice_label(voice)
-        outfile = os.path.join(outdir, f"positive_{i:04d}_{voice_tag}_{name}.wav")
+        semantic_name = f"{voice_tag}_{name}_{style_tag}"
+        semantic_key = f"positive:{semantic_name}"
+        semantic_cursor += 1
+        if semantic_key in existing_keys:
+            continue
+        uid_tag = f"uid{next_idx:06x}"
+        outfile_name = f"positive_{next_idx:06d}_{uid_tag}_{semantic_name}.wav"
+        outfile = os.path.join(outdir, outfile_name)
+        if outfile_name in existing_names or os.path.exists(outfile):
+            next_idx += 1
+            continue
         try:
-            if (i + 1) % 10 == 0 or i == 0:
-                log(f"  Positives: {i+1}/{count}")
-            if gen_spoken_positive(phrase, outfile, tts_backend, name, i, duration=2.0, voice=voice):
+            if (generated + 1) % 10 == 0 or generated == 0:
+                log(f"  Positives: {generated+1}/{count}")
+            if gen_spoken_positive(phrase, outfile, synthesizer, name, next_idx, duration=2.0, voice=voice):
                 generated += 1
                 by_type[name] += 1
                 by_voice[voice_tag] += 1
+                existing_names.add(outfile_name)
+                existing_keys.add(semantic_key)
+                next_idx += 1
+            else:
+                next_idx += 1
         except Exception as e:
-            log(f"ERROR positive {i}: {e}")
+            log(f"ERROR positive idx={next_idx}: {e}")
+            next_idx += 1
+
+    if generated < count:
+        log(f"WARNING: generated {generated}/{count} positives before hitting attempt limit ({max_attempts}).")
 
     log(f"✓ Positive: {generated}/{count} generated")
     for name in sorted(by_type):
@@ -580,20 +514,16 @@ def gen_positives(phrase, outdir, count=50, tts_backend=None, voice_pool=None):
     return generated
 
 
-def gen_negatives(outdir, count=50, min_new=50, tts_backend=None, voice_pool=None, wake_phrase=""):
-    """Generate negative training samples (background audio)."""
+def gen_negatives(outdir, count=50, min_new=50, synthesizer=None, voice_pool=None, wake_phrase=""):
     target_new = max(count, min_new)
     if target_new != count:
         log(f"Generating at least {min_new} new negatives (requested {count} -> target {target_new})")
     else:
         log(f"Generating {target_new} negative samples")
     Path(outdir).mkdir(parents=True, exist_ok=True)
-    existing_names, max_existing_idx, existing_type_counts = scan_existing_negatives(outdir)
+    existing_names, max_existing_idx, existing_keys, existing_type_counts = scan_existing_clips(outdir, "negative")
     if existing_names:
-        log(
-            f"  Found {len(existing_names)} existing negatives (max index {max_existing_idx}); "
-            "appending unique new samples."
-        )
+        log(f"  Found {len(existing_names)} existing negatives (max index {max_existing_idx}); appending unique new samples.")
     if existing_type_counts:
         for name in sorted(existing_type_counts):
             log(f"    existing - {name}: {existing_type_counts[name]}")
@@ -614,17 +544,23 @@ def gen_negatives(outdir, count=50, min_new=50, tts_backend=None, voice_pool=Non
         "speech_quiet",
     ]
 
-    next_idx = max_existing_idx + 1
-    if next_idx < 0:
-        next_idx = 0
+    next_idx = max(max_existing_idx + 1, 0)
     generated = 0
     by_type = Counter()
     attempts = 0
     max_attempts = max(10, target_new * 30)
+    semantic_cursor = len(existing_keys)
     while generated < target_new and attempts < max_attempts:
         attempts += 1
-        name = variations[generated % len(variations)]
-        outfile_name = f"negative_{next_idx:06d}_{name}.wav"
+        name = variations[semantic_cursor % len(variations)]
+        style_tag = f"style{alpha_token(semantic_cursor // len(variations))}"
+        semantic_name = f"{name}_{style_tag}"
+        semantic_key = f"negative:{semantic_name}"
+        semantic_cursor += 1
+        if semantic_key in existing_keys:
+            continue
+        uid_tag = f"uid{next_idx:06x}"
+        outfile_name = f"negative_{next_idx:06d}_{uid_tag}_{semantic_name}.wav"
         outfile = os.path.join(outdir, outfile_name)
         if outfile_name in existing_names or os.path.exists(outfile):
             next_idx += 1
@@ -636,13 +572,14 @@ def gen_negatives(outdir, count=50, min_new=50, tts_backend=None, voice_pool=Non
                 name,
                 outfile,
                 next_idx,
-                tts_backend=tts_backend,
+                synthesizer=synthesizer,
                 voice_pool=voice_pool,
                 wake_phrase=wake_phrase,
             ):
                 generated += 1
                 by_type[name] += 1
                 existing_names.add(outfile_name)
+                existing_keys.add(semantic_key)
                 next_idx += 1
             else:
                 next_idx += 1
@@ -662,46 +599,41 @@ def gen_negatives(outdir, count=50, min_new=50, tts_backend=None, voice_pool=Non
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(description="Generate training samples")
-    parser.add_argument("--wake-phrase", default="hello world",
-                        help="Wake word phrase")
-    parser.add_argument("--data-dir", default="./wakeword_lab/data",
-                        help="Output directory for samples")
-    parser.add_argument("--positives", type=int, default=50,
-                        help="Number of positive samples")
-    parser.add_argument("--negatives", type=int, default=50,
-                        help="Number of negative samples")
-    parser.add_argument("--min-new-negatives", type=int, default=50,
-                        help="Minimum number of new unique negatives to append each run")
+    parser.add_argument("--wake-phrase", default="hello world", help="Wake word phrase")
+    parser.add_argument("--data-dir", default="./wakeword_lab/data", help="Output directory for samples")
+    parser.add_argument("--positives", type=int, default=50, help="Number of positive samples")
+    parser.add_argument("--negatives", type=int, default=50, help="Number of negative samples")
+    parser.add_argument("--min-new-negatives", type=int, default=50, help="Minimum new unique negatives to append each run")
+    parser.add_argument("--piper-max-voices", type=int, default=8, help="Maximum number of high-quality Piper voices")
     args = parser.parse_args()
+
     log(f"Sample Generator: '{args.wake_phrase}'")
     log(f"  Positives: {args.positives}")
     log(f"  Negatives: {args.negatives}")
     log(f"  Min new negatives: {args.min_new_negatives}")
+    log(f"  Max Piper voices: {args.piper_max_voices}")
 
     require_cmd("ffmpeg")
-    tts_backend = None
+
+    synthesizer = None
     voice_pool = None
     if args.positives > 0 or args.negatives > 0:
-        tts_backend = detect_tts_backend()
-        if not tts_backend:
-            raise RuntimeError(
-                "No local TTS backend found. Install espeak-ng/espeak, use macOS say, "
-                "or run on Windows with PowerShell speech synthesis."
-            )
-        voice_pool = resolve_tts_voice_pool(tts_backend)
+        piper_download_dir = os.path.join(args.data_dir, "piper_voices")
+        voice_pool = resolve_piper_voice_pool(
+            max_voices=max(1, args.piper_max_voices),
+            download_dir=Path(piper_download_dir),
+        )
         if not voice_pool:
-            raise RuntimeError("No TTS voices detected for backend")
-        log(f"  TTS backend: {tts_backend}")
-        nonempty_voices = [v for v in voice_pool if v]
-        if args.negatives > 0 and len(nonempty_voices) < 2:
-            raise RuntimeError("Need at least two TTS voices for diverse spoken negatives.")
+            raise RuntimeError("No high-quality English Piper voices found")
+        synthesizer = PiperSynthesizer(voice_pool=voice_pool, download_dir=piper_download_dir)
+        log(f"  Piper voice pool ({len(voice_pool)}): {', '.join(voice_pool)}")
+        log(f"  Piper voice cache: {piper_download_dir}")
+        synthesizer.ensure_voices()
+        if args.negatives > 0 and len(voice_pool) < 2:
+            raise RuntimeError("Need at least two Piper voices for diverse spoken negatives.")
 
     phrase_slug = slugify_phrase(args.wake_phrase)
-    removed_legacy = purge_legacy_flat_positives(args.data_dir)
-    if removed_legacy:
-        log(f"  Removed {removed_legacy} legacy flat positives from {os.path.join(args.data_dir, 'positives')}")
     pos_dir = os.path.join(args.data_dir, "positives", phrase_slug)
     neg_dir = os.path.join(args.data_dir, "negatives")
     log(f"  Positive dir: {pos_dir}")
@@ -713,23 +645,23 @@ def main():
             args.wake_phrase,
             pos_dir,
             args.positives,
-            tts_backend=tts_backend,
+            synthesizer=synthesizer,
             voice_pool=voice_pool,
         )
+
     n_count = 0
     if args.negatives > 0:
         n_count = gen_negatives(
             neg_dir,
             args.negatives,
             min_new=args.min_new_negatives,
-            tts_backend=tts_backend,
+            synthesizer=synthesizer,
             voice_pool=voice_pool,
             wake_phrase=args.wake_phrase,
         )
 
     total = p_count + n_count
     log(f"✓ Complete! {total} samples generated")
-
     if total == 0:
         sys.exit(1)
 

@@ -7,7 +7,7 @@ import json
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
 APP_DIR = os.path.dirname(__file__)
-BASE_DIR = os.environ.get("BASE_DIR", "/workspace")
+BASE_DIR = os.environ.get("BASE_DIR", "/workspace/data")
 TRAINER_SH = os.path.join(APP_DIR, "trainer.sh")
 WORKFLOWS_PATH = os.path.join(APP_DIR, "device_workflows.json")
 
@@ -128,7 +128,7 @@ INDEX_HTML = f"""
     </div>
         <div class="mb-3">
             <label class="form-label">Piper host</label>
-            <input class="form-control" name="piper_host" id="piper_host" value="kulfi.local">
+            <input class="form-control" name="piper_host" id="piper_host" value="piper">
         </div>
         <div class="mb-3">
             <label class="form-label">Piper port</label>
@@ -136,7 +136,7 @@ INDEX_HTML = f"""
         </div>
         <div class="mb-3">
             <label class="form-label">openWakeWord host</label>
-            <input class="form-control" name="oww_host" id="oww_host" value="kulfi.local">
+            <input class="form-control" name="oww_host" id="oww_host" value="openwakeword">
         </div>
         <div class="mb-3">
             <label class="form-label">openWakeWord port</label>
@@ -197,7 +197,7 @@ function applyDeviceDefaults() {{
     threadsInput.value = String(threads);
     threadsInput.readOnly = deviceId !== 'custom_manual';
 
-    const piperHost = device.piper_host || defaults.piper_host || 'kulfi.local';
+    const piperHost = device.piper_host || defaults.piper_host || 'piper';
     piperHostInput.value = piperHost;
     piperHostInput.readOnly = deviceId !== 'custom_manual';
 
@@ -205,7 +205,7 @@ function applyDeviceDefaults() {{
     piperPortInput.value = String(piperPort);
     piperPortInput.readOnly = deviceId !== 'custom_manual';
 
-    const owwHost = device.oww_host || defaults.oww_host || 'kulfi.local';
+    const owwHost = device.oww_host || defaults.oww_host || 'openwakeword';
     owwHostInput.value = owwHost;
     owwHostInput.readOnly = deviceId !== 'custom_manual';
 
@@ -283,9 +283,9 @@ def start():
     profile = request.form.get('profile', 'medium')
     threads = request.form.get('threads', '1')
     model_format = request.form.get('format', 'tflite')
-    piper_host = request.form.get('piper_host', 'kulfi.local')
+    piper_host = request.form.get('piper_host', 'piper')
     piper_port = request.form.get('piper_port', '10200')
-    oww_host = request.form.get('oww_host', 'kulfi.local')
+    oww_host = request.form.get('oww_host', 'openwakeword')
     oww_port = request.form.get('oww_port', '10400')
     preset_id = request.form.get('sample_preset', DEFAULT_PRESET_ID)
 
