@@ -1,0 +1,84 @@
+# Multi-stage build for wakeword training environment
+FROM python:3.11-slim-bookworm AS base
+
+# Install system dependencies (unset proxy for apt)
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    git \
+    tmux \
+    ffmpeg \
+    sox \
+    libsndfile1 \
+    libsndfile1-dev \
+    libasound2-dev \
+    libffi-dev \
+    libssl-dev \
+    jq \
+    curl \
+    ca-certificates \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Create workspace directory
+RUN mkdir -p /workspace /workspace/custom_models /workspace/data
+
+# Copy requirements first for better caching
+COPY requirements.txt* ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+    pyyaml \
+    numpy \
+    scipy \
+    soundfile \
+    resampy \
+    tqdm \
+    matplotlib \
+    scikit-learn \
+    onnx \
+    onnxruntime \
+    onnxscript \
+    datasets \
+    speechbrain \
+    torch \
+    torchaudio \
+    piper-tts \
+    flask \
+    setuptools \
+    torchinfo \
+    torchmetrics \
+    pronouncing \
+    mutagen \
+    acoustics \
+    audiomentations \
+    torch-audiomentations
+
+# Clone openWakeWord repository
+RUN git clone --depth 1 https://github.com/dscripka/openWakeWord.git /workspace/openWakeWord_upstream && \
+    cd /workspace/openWakeWord_upstream && \
+    pip install --no-cache-dir -e .
+
+# Copy application files
+COPY . .
+
+# Make scripts executable
+RUN chmod +x trainer.sh orchestrate.sh 2>/dev/null || true
+
+# Set environment variables
+ENV PYTHONPATH=/workspace/openWakeWord_upstream:${PYTHONPATH}
+ENV BASE_DIR=/workspace
+ENV OWW_REPO_DIR=/workspace/openWakeWord_upstream
+ENV VENV_DIR=/usr/local
+ENV PATH=/usr/local/bin:${PATH}
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import openwakeword; print('OK')" || exit 1
+
+CMD ["/bin/bash"]

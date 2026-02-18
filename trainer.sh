@@ -317,8 +317,12 @@ EOF
     return 0
   fi
 
-  # Case 2: Available via APT (preferred on Raspberry Pi)
-  if command -v apt-cache >/dev/null 2>&1 && apt-cache show python3-tflite-runtime >/dev/null 2>&1; then
+  # Check if we're in Docker - skip APT in containers
+  local in_docker=0
+  [[ -f "/.dockerenv" ]] && in_docker=1
+  
+  # Case 2: Available via APT (preferred on Raspberry Pi) - skip in Docker
+  if [[ $in_docker -eq 0 ]] && command -v apt-cache >/dev/null 2>&1 && apt-cache show python3-tflite-runtime >/dev/null 2>&1; then
     if ! dpkg -s python3-tflite-runtime >/dev/null 2>&1; then
       log "Installing tflite-runtime via APT (python3-tflite-runtime)..."
       sudo_maybe apt-get install -y --no-install-recommends python3-tflite-runtime
@@ -658,11 +662,32 @@ main() {
 
   # If the repo path contains a stub openWakeWord checkout, switch to a real clone.
   local stub_train_py="$repo_dir/openwakeword/train.py"
-  if [[ -f "$stub_train_py" ]] \
-    && grep -Eqi "stub openwakeword|dummy model|simulated" "$stub_train_py"; then
+  log "DEBUG: Checking stub at $stub_train_py (file exists: $([[ -f "$stub_train_py" ]] && echo yes || echo no))"
+  
+  local is_stub=0
+  if [[ -f "$stub_train_py" ]]; then
+    log "DEBUG: File exists, checking grep..."
+    # Explicitly test each pattern
+    if grep -qi "stub openwakeword" "$stub_train_py" 2>/dev/null; then
+      log "DEBUG: Found 'stub openwakeword'"
+      is_stub=1
+    elif grep -qi "dummy model" "$stub_train_py" 2>/dev/null; then
+      log "DEBUG: Found 'dummy model'"
+      is_stub=1
+    elif grep -qi "simulated" "$stub_train_py" 2>/dev/null; then
+      log "DEBUG: Found 'simulated'"
+      is_stub=1
+    else
+      log "DEBUG: No stub markers found"
+    fi
+  fi
+  
+  log "DEBUG: is_stub=$is_stub"
+  if [[ $is_stub -eq 1 ]]; then
     log "Detected stub openWakeWord checkout at $repo_dir."
     local upstream_repo_dir="$base_dir/openWakeWord_upstream"
     repo_dir="$upstream_repo_dir"
+    log "DEBUG: Switched repo_dir to $repo_dir"
   fi
 
   validate_base_dir "$base_dir"
@@ -670,8 +695,13 @@ main() {
   require_free_disk_gb "$base_dir" "${MIN_FREE_DISK_GB:-8}"
 
   local apt_stamp="$logs_dir/.apt_updated"
-  if command -v apt-get >/dev/null 2>&1; then
-    # Core tooling (Debian/Ubuntu/Raspbian)
+  
+  # Check if we're in a Docker container
+  local in_docker=0
+  [[ -f "/.dockerenv" ]] && in_docker=1
+  
+  if [[ $in_docker -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
+    # Core tooling (Debian/Ubuntu/Raspbian) - only if not in Docker
     local -a req_pkgs=(
       ca-certificates
       curl
@@ -771,6 +801,7 @@ main() {
   log "Installing Python packages (best-effort superset for openWakeWord training + Piper dataset gen)..."
   install_tflite_runtime_if_available || log "WARNING: tflite-runtime setup failed; continuing without it."
   local -a pip_pkgs=(
+    setuptools
     pyyaml
     numpy
     scipy
@@ -783,6 +814,13 @@ main() {
     onnxruntime
     datasets
     speechbrain
+    torchinfo
+    torchmetrics
+    pronouncing
+    mutagen
+    acoustics
+    audiomentations
+    torch-audiomentations
   )
   if [[ "$have_wyoming_piper" -eq 1 || "$have_local_wyoming_piper" -eq 1 ]]; then
     log "Wyoming piper detected; skipping piper-tts install."
