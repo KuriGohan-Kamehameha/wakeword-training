@@ -2,26 +2,12 @@ import subprocess
 import os
 import time
 import threading
-import sys
 import json
 
-VENV_DIR = os.path.join(os.path.dirname(__file__), ".venv")
-try:
-    from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-except ImportError as exc:
-    in_venv = getattr(sys, "prefix", "") != getattr(sys, "base_prefix", "")
-    if in_venv:
-        subprocess.run([sys.executable, "-m", "pip", "install", "flask"], check=True)
-        from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-    else:
-        raise RuntimeError(
-            "Flask is not installed in the active interpreter. "
-            "Run via 'bash orchestrate.sh' (which creates .venv) or activate a venv first."
-        ) from exc
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
 APP_DIR = os.path.dirname(__file__)
-VENV_DIR = os.path.join(APP_DIR, ".venv")
-BASE_DIR = os.path.join(APP_DIR, "wakeword_lab")
+BASE_DIR = os.environ.get("BASE_DIR", "/workspace")
 TRAINER_SH = os.path.join(APP_DIR, "trainer.sh")
 WORKFLOWS_PATH = os.path.join(APP_DIR, "device_workflows.json")
 
@@ -345,9 +331,8 @@ def start():
         '--wyoming-oww-port', str(oww_port),
     ]
 
-    # Launch trainer in background using the venv's python for environment
+    # Launch trainer in background.
     env = os.environ.copy()
-    env['VENV_DIR'] = VENV_DIR
     preset = next((p for p in SAMPLE_PRESETS if p["id"] == preset_id), None)
     if preset is None:
         preset = next((p for p in SAMPLE_PRESETS if p["id"] == DEFAULT_PRESET_ID), SAMPLE_PRESETS[0])
@@ -459,16 +444,4 @@ def log():
         return jsonify(log=f'Error reading log: {e}')
 
 if __name__ == '__main__':
-    # Ensure venv exists and install minimal packages
-    if not os.path.isdir(VENV_DIR):
-        import venv
-        venv.create(VENV_DIR, with_pip=True)
-        pip = os.path.join(VENV_DIR, 'bin', 'pip')
-        subprocess.run([pip, 'install', 'flask'], check=True)
-    python = os.path.join(VENV_DIR, 'bin', 'python')
-    # If running inside the venv already, just run app
-    if os.path.realpath(sys.executable) == os.path.realpath(python):
-        app.run(port=5000)
-    else:
-        # Relaunch inside venv
-        subprocess.run([python, __file__])
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

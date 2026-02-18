@@ -7,7 +7,6 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     build-essential \
     pkg-config \
     git \
-    tmux \
     ffmpeg \
     sox \
     libsndfile1 \
@@ -15,7 +14,6 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     libasound2-dev \
     libffi-dev \
     libssl-dev \
-    jq \
     curl \
     ca-certificates \
     netcat-openbsd \
@@ -26,9 +24,6 @@ WORKDIR /app
 
 # Create workspace directory
 RUN mkdir -p /workspace /workspace/custom_models /workspace/data
-
-# Copy requirements first for better caching
-COPY requirements.txt* ./
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
@@ -68,13 +63,12 @@ RUN git clone --depth 1 https://github.com/dscripka/openWakeWord.git /workspace/
 COPY . .
 
 # Make scripts executable
-RUN chmod +x trainer.sh orchestrate.sh 2>/dev/null || true
+RUN chmod +x trainer.sh docker-train.sh generate_dataset.py generate_training_samples.py 2>/dev/null || true
 
 # Set environment variables
 ENV PYTHONPATH=/workspace/openWakeWord_upstream:${PYTHONPATH}
 ENV BASE_DIR=/workspace
 ENV OWW_REPO_DIR=/workspace/openWakeWord_upstream
-ENV VENV_DIR=/usr/local
 ENV PATH=/usr/local/bin:${PATH}
 
 # Health check

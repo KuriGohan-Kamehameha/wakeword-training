@@ -58,7 +58,6 @@ services:
       - BASE_DIR=/workspace
       - ALLOW_LOW_DISK=1
       - PYTHONUNBUFFERED=1
-      - TRAIN_NOW=${TRAIN_NOW:-}
       - TRAIN_PROFILE=${TRAIN_PROFILE:-medium}
       - TRAIN_THREADS=${TRAIN_THREADS:-2}
       - MODEL_FORMAT=${MODEL_FORMAT:-tflite}

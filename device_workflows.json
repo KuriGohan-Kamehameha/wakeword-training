@@ -64,6 +64,18 @@
       "notes": "ESPHome wake word components expect .tflite models."
     },
     {
+      "id": "atom_echo",
+      "label": "Atom Echo",
+      "formats": [
+        "tflite"
+      ],
+      "default_format": "tflite",
+      "profile": "tiny",
+      "max_filesize_kb": 80,
+      "threads": 2,
+      "notes": "Recommended for M5Stack Atom Echo deployments via ESPHome/openWakeWord."
+    },
+    {
       "id": "anki_vector_wirepod",
       "label": "Anki Vector (wire-pod)",
       "formats": [

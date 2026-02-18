@@ -1,81 +1,49 @@
 # wakeword-training
-Training project for wake word detection
 
-## Usage
+Docker-first wake word training for openWakeWord.
 
-### Interactive Mode (Default)
+## Prerequisites
 
-Run the trainer script and it will prompt you for required parameters:
+- Docker Desktop (or Docker Engine + Compose plugin)
+- Running Docker daemon
 
-```bash
-bash trainer.sh
-```
-
-### CLI Mode (Non-Interactive)
-
-For automated testing or CI/CD pipelines, you can run the script in non-interactive mode using command-line arguments or environment variables:
-
-#### Using Command-Line Arguments
+## Quick Start
 
 ```bash
-bash trainer.sh \
-  --wake-phrase "hey assistant" \
-  --train-profile tiny \
-  --train-threads 2 \
-  --non-interactive
+# Optional: inspect available device presets
+./docker-train.sh --list-devices
+
+# Train Argus for Atom Echo (tiny+tflite defaults from device profile)
+./docker-train.sh \
+  --wake-phrase "Argus" \
+  --device atom_echo \
+  --generate-samples
 ```
 
-#### Using Environment Variables
+Artifacts are written to:
+
+- `./wakeword_lab/custom_models/`
+
+## Common Commands
 
 ```bash
-WAKE_PHRASE="hey assistant" \
-TRAIN_PROFILE="tiny" \
-TRAIN_THREADS="2" \
-bash trainer.sh --non-interactive
+# Rebuild images then train
+./docker-train.sh --build --wake-phrase "Computer" --device esphome_generic
+
+# Train without synthetic sample generation (use your own data in wakeword_lab/data)
+./docker-train.sh --wake-phrase "Jarvis" --profile medium --format tflite
+
+# Open shell in trainer container
+./docker-train.sh --shell
+
+# Stop services
+docker compose down
 ```
 
-#### Running Without tmux
+## Data Layout
 
-By default, training runs in a tmux session. To run training directly in the current terminal (useful for testing or CI):
+- `wakeword_lab/data/positives/` - positive audio clips
+- `wakeword_lab/data/negatives/` - negative audio clips
+- `wakeword_lab/custom_models/` - exported model artifacts
 
-```bash
-bash trainer.sh \
-  --wake-phrase "hey assistant" \
-  --train-profile tiny \
-  --train-threads 2 \
-  --non-interactive \
-  --no-tmux
-```
-
-### Available Options
-
-Run `bash trainer.sh --help` to see all available options.
-
-Key options for CLI mode:
-- `--wake-phrase TEXT` - The wake phrase to train (e.g., "hey assistant")
-- `--train-profile NAME` - Training profile: tiny, medium, or large
-- `--train-threads NUMBER` - Number of CPU threads to use
-- `--non-interactive` - Skip all interactive prompts; use defaults or provided values
-- `--no-tmux` - Run training in current terminal instead of tmux session
-
-## Testing
-
-To test the training script without actually running a full training session, you can use the `--help` flag to verify the CLI arguments are recognized:
-
-```bash
-bash trainer.sh --help
-```
-
-For quick testing in non-interactive mode:
-
-```bash
-# Test with minimal parameters (will use defaults for everything else)
-bash trainer.sh \
-  --wake-phrase "test phrase" \
-  --train-profile tiny \
-  --train-threads 1 \
-  --non-interactive \
-  --no-tmux
-```
-
-**Note**: The script automatically detects when it's not running in a TTY (e.g., in CI/CD pipelines) and will use default values for any parameters not explicitly provided, even without the `--non-interactive` flag.
+For deeper Docker stack details, see `README-docker.md`.
