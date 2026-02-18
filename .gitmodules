@@ -1,0 +1,3 @@
+[submodule "piper-sample-generator"]
+	path = piper-sample-generator
+	url = https://github.com/dscripka/piper-sample-generator.git

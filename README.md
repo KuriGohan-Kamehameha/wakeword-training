@@ -12,6 +12,8 @@ Docker-first wakeword training for openWakeWord, with an end-to-end workflow tha
 
 - Docker Desktop (Windows/macOS) or Docker Engine + Compose plugin (Linux)
 - Running Docker daemon
+- Initialize bundled submodule once after clone:
+  - `git submodule update --init --recursive`
 
 ## Quick start
 
