@@ -228,15 +228,24 @@ docker compose up -d piper openwakeword
 echo "Waiting for services to become healthy..."
 MAX_WAIT=40
 WAITED=0
+SERVICES_HEALTHY=0
 while [[ "$WAITED" -lt "$MAX_WAIT" ]]; do
-  if docker compose ps | grep -q "healthy.*piper" && docker compose ps | grep -q "healthy.*openwakeword"; then
+  if docker compose ps piper | grep -qi "healthy" && docker compose ps openwakeword | grep -qi "healthy"; then
     echo "Services are healthy."
+    SERVICES_HEALTHY=1
     break
   fi
   sleep 2
   WAITED=$((WAITED + 2))
   echo "  waiting... (${WAITED}s/${MAX_WAIT}s)"
 done
+
+if [[ "$SERVICES_HEALTHY" -ne 1 ]]; then
+  echo "ERROR: Services did not become healthy within ${MAX_WAIT}s." >&2
+  docker compose ps >&2 || true
+  docker compose logs --tail=80 piper openwakeword >&2 || true
+  exit 1
+fi
 
 if [[ "$SHELL_MODE" -eq 1 ]]; then
   echo "Opening shell in trainer container..."

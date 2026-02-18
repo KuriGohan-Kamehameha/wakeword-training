@@ -62,6 +62,79 @@ require_cmd() {
   command -v "$c" >/dev/null 2>&1 || die "Missing required command: ${c}"
 }
 
+convert_onnx_with_onnx2tf() {
+  local onnx_path="${1:?}"
+  local work_root="${2:-}"
+  local cleanup_work_root=0
+
+  [[ -f "$onnx_path" ]] || die "ONNX path does not exist: $onnx_path"
+
+  if [[ -z "$work_root" ]]; then
+    work_root="$(mktemp -d)"
+    cleanup_work_root=1
+  fi
+
+  local model_base
+  model_base="$(basename "${onnx_path%.onnx}")"
+  local out_dir="$work_root/onnx2tf_${model_base}"
+  local cache_root="${ONNX2TF_CACHE_DIR:-${BASE_DIR:-/workspace}/.cache/onnx2tf}"
+  local venv_dir="$cache_root/venv_tf219_onnx2tf1263"
+  local deps_stamp="$venv_dir/.deps_stamp"
+  local deps_key="tensorflow==2.19.0|tf-keras==2.19.0|onnx==1.19.0|onnx2tf==1.26.3|onnxruntime|onnx-graphsurgeon|sng4onnx|psutil"
+  local output_tflite="${onnx_path%.onnx}.tflite"
+  mkdir -p "$out_dir" "$cache_root"
+
+  if [[ ! -x "$venv_dir/bin/python3" ]]; then
+    python3 -m venv "$venv_dir"
+  fi
+
+  # shellcheck disable=SC1091
+  source "$venv_dir/bin/activate"
+
+  local install_deps=1
+  if [[ -f "$deps_stamp" ]] && [[ "$(cat "$deps_stamp")" == "$deps_key" ]]; then
+    install_deps=0
+  fi
+
+  if [[ "$install_deps" -eq 1 ]]; then
+    python3 -m pip install --upgrade pip
+    python3 -m pip install \
+      tensorflow==2.19.0 \
+      tf-keras==2.19.0 \
+      onnx==1.19.0 \
+      onnx2tf==1.26.3 \
+      onnxruntime \
+      onnx-graphsurgeon \
+      sng4onnx \
+      psutil
+    echo "$deps_key" > "$deps_stamp"
+  fi
+
+  local -a onnx2tf_args
+  onnx2tf_args=(-i "$onnx_path" -o "$out_dir")
+  if ! command -v onnxsim >/dev/null 2>&1; then
+    # Avoid noisy optimizer traceback when onnxsim is intentionally absent.
+    onnx2tf_args+=(--not_use_onnxsim)
+  fi
+  python3 -m onnx2tf "${onnx2tf_args[@]}"
+
+  local candidate="$out_dir/${model_base}_float32.tflite"
+  if [[ ! -f "$candidate" ]]; then
+    candidate="$(find "$out_dir" -maxdepth 1 -type f -name "*.tflite" | sort | head -n 1 || true)"
+  fi
+  [[ -n "$candidate" && -f "$candidate" ]] || die "onnx2tf fallback did not produce .tflite for: $onnx_path"
+
+  cp -f "$candidate" "$output_tflite"
+  deactivate >/dev/null 2>&1 || true
+
+  rm -rf "$out_dir" 2>/dev/null || true
+  if [[ "$cleanup_work_root" -eq 1 ]]; then
+    rm -rf "$work_root" 2>/dev/null || true
+  fi
+
+  log "Fallback conversion complete: $onnx_path -> $output_tflite"
+}
+
 expand_tilde() {
   local path="${1:?}"
   if [[ "$path" == "~" ]]; then
@@ -460,12 +533,84 @@ PY
     large) epochs=50 ;;
   esac
 
+  # Training scale presets (higher values for better model quality).
+  local train_steps=1600
+  local n_samples=700
+  local n_samples_val=140
+  local default_max_positive=250
+  case "$train_profile" in
+    tiny)
+      train_steps=800
+      n_samples=300
+      n_samples_val=60
+      default_max_positive=200
+      ;;
+    medium)
+      train_steps=1600
+      n_samples=700
+      n_samples_val=140
+      default_max_positive=250
+      ;;
+    large)
+      train_steps=2500
+      n_samples=1000
+      n_samples_val=200
+      default_max_positive=300
+      ;;
+  esac
+
   local cfg_in="$repo_dir/examples/custom_model.yml"
   local cfg_out="$run_dir/training_config.yml"
   [[ -f "$cfg_in" ]] || die "Expected training template missing: $cfg_in"
   cp -f "$cfg_in" "$cfg_out"
 
-  RUN_DIR="$run_dir" DATASET_JSON="$dataset_json" WAKE_PHRASE="$wake_phrase" MODEL_SLUG="$model_slug" EPOCHS="$epochs" python3 - <<'PY'
+  local piper_generator_dir="${PIPER_SAMPLE_GENERATOR_DIR:-/app/piper-sample-generator}"
+  if [[ ! -f "$piper_generator_dir/generate_samples.py" ]]; then
+    log "WARNING: piper sample generator not found at $piper_generator_dir"
+  fi
+  local piper_model_file="$piper_generator_dir/models/en-us-libritts-high.pt"
+  [[ -f "$piper_model_file" ]] || die "Missing Piper generator model file: $piper_model_file"
+
+  local source_negative_dir="${DATA_NEGATIVE_DIR:-$data_dir/negatives}"
+  [[ -d "$source_negative_dir" ]] || die "Negative audio directory missing: $source_negative_dir"
+
+  local normalized_negative_dir="$run_dir/negative_16k"
+  mkdir -p "$normalized_negative_dir"
+
+  SOURCE_NEGATIVE_DIR="$source_negative_dir" NORMALIZED_NEGATIVE_DIR="$normalized_negative_dir" python3 - <<'PY'
+import os
+import numpy as np
+import resampy
+import soundfile as sf
+
+src = os.environ["SOURCE_NEGATIVE_DIR"]
+dst = os.environ["NORMALIZED_NEGATIVE_DIR"]
+
+wav_files = sorted(
+    f for f in os.listdir(src)
+    if f.lower().endswith(".wav") and os.path.isfile(os.path.join(src, f))
+)
+if not wav_files:
+    raise SystemExit(f"No .wav files found in negative source directory: {src}")
+
+processed = 0
+for name in wav_files:
+    in_path = os.path.join(src, name)
+    out_path = os.path.join(dst, name)
+
+    audio, sr = sf.read(in_path, dtype="float32", always_2d=False)
+    if isinstance(audio, np.ndarray) and audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    if sr != 16000:
+        audio = resampy.resample(audio, sr, 16000)
+
+    sf.write(out_path, audio, 16000, subtype="PCM_16")
+    processed += 1
+
+print(f"Prepared normalized negative clips: {processed} -> {dst}")
+PY
+
+  RUN_DIR="$run_dir" DATASET_JSON="$dataset_json" WAKE_PHRASE="$wake_phrase" MODEL_SLUG="$model_slug" EPOCHS="$epochs" TRAIN_STEPS="$train_steps" N_SAMPLES="$n_samples" N_SAMPLES_VAL="$n_samples_val" PIPER_SAMPLE_GENERATOR_DIR="$piper_generator_dir" DATA_NEGATIVE_DIR="$normalized_negative_dir" python3 - <<'PY'
 import os
 import yaml
 
@@ -473,8 +618,13 @@ cfg_path = os.environ["RUN_DIR"] + "/training_config.yml"
 wake_phrase = os.environ["WAKE_PHRASE"]
 model_slug = os.environ["MODEL_SLUG"]
 epochs = int(os.environ["EPOCHS"])
+train_steps = int(os.environ["TRAIN_STEPS"])
+n_samples = int(os.environ["N_SAMPLES"])
+n_samples_val = int(os.environ["N_SAMPLES_VAL"])
 run_dir = os.environ["RUN_DIR"]
 dataset_json = os.environ["DATASET_JSON"]
+piper_generator_dir = os.environ.get("PIPER_SAMPLE_GENERATOR_DIR", "").strip()
+negative_dir = os.environ.get("DATA_NEGATIVE_DIR", "").strip() or os.path.join(run_dir, model_slug, "negative_train")
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
@@ -508,16 +658,49 @@ for k in ("dataset_path", "dataset_json", "custom_dataset_path", "custom_dataset
 for k in ("epochs", "n_epochs", "num_epochs", "max_epochs"):
     set_key_recursive(cfg, k, epochs)
 
+for k in ("steps", "max_steps"):
+    set_key_recursive(cfg, k, train_steps)
+
+for k in ("n_samples",):
+    set_key_recursive(cfg, k, n_samples)
+
+for k in ("n_samples_val",):
+    set_key_recursive(cfg, k, n_samples_val)
+
+if piper_generator_dir:
+    for k in ("piper_sample_generator_path", "sample_generator_path"):
+        set_key_recursive(cfg, k, piper_generator_dir)
+
+for k in ("rir_paths",):
+    set_key_recursive(cfg, k, [negative_dir])
+
+for k in ("background_paths",):
+    set_key_recursive(cfg, k, [negative_dir])
+
+for k in ("background_paths_duplication_rate",):
+    set_key_recursive(cfg, k, [1])
+
+# Train only from generated positive/adversarial features for portability.
+cfg["feature_data_files"] = {}
+cfg["batch_n_per_class"] = {"positive": 64, "adversarial_negative": 64}
+cfg["false_positive_validation_data_path"] = os.path.join(run_dir, model_slug, "false_positive_validation.npy")
+updated.extend(["feature_data_files", "batch_n_per_class", "false_positive_validation_data_path"])
+
 with open(cfg_path, "w", encoding="utf-8") as f:
     yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 print("Updated YAML keys:", sorted(set(updated)))
 PY
 
-  local positive_sources="${POSITIVE_SOURCES:-$data_dir/positives}"
-  local negative_sources="${NEGATIVE_SOURCES:-$data_dir/negatives}"
-  local max_positive="${MAX_POSITIVE_SAMPLES:-250}"
-  local max_negative="${MAX_NEGATIVE_SAMPLES:-1000}"
+  local default_positive_sources="$data_dir/positives"
+  local scoped_positive_dir="$data_dir/positives/$model_slug"
+  if [[ -d "$scoped_positive_dir" ]] && find "$scoped_positive_dir" -maxdepth 1 -type f | grep -q .; then
+    default_positive_sources="$scoped_positive_dir"
+  fi
+  local positive_sources="${POSITIVE_SOURCES:-$default_positive_sources}"
+  local negative_sources="${NEGATIVE_SOURCES:-$normalized_negative_dir}"
+  local max_positive="${MAX_POSITIVE_SAMPLES:-$default_max_positive}"
+  local max_negative="${MAX_NEGATIVE_SAMPLES:-}"
   local min_per_source="${MIN_PER_SOURCE:-3}"
   local dataset_seed="${DATASET_SEED:-42}"
 
@@ -563,9 +746,159 @@ PY
 
   (
     cd "$repo_dir"
-    python3 openwakeword/train.py --training_config "$cfg_out" --generate_clips
+    python3 - <<'PY'
+from pathlib import Path
+import re
+
+path = Path("openwakeword/train.py")
+text = path.read_text(encoding="utf-8")
+updated = re.sub(r"num_workers=n_cpus,\s*prefetch_factor=16", "num_workers=0", text, count=1)
+updated = re.sub(r'default="False"', "default=False", updated)
+
+if updated != text:
+    path.write_text(updated, encoding="utf-8")
+    print("Patched train.py defaults and DataLoader settings for container training")
+else:
+    print("train.py patches already applied")
+PY
+    run_generate_clips() {
+      local attempts=0
+      local max_attempts=2
+      local rc=0
+      while (( attempts < max_attempts )); do
+        attempts=$((attempts + 1))
+        if python3 openwakeword/train.py --training_config "$cfg_out" --generate_clips; then
+          return 0
+        fi
+        rc=$?
+        if [[ "$rc" -eq 137 && "$attempts" -lt "$max_attempts" ]]; then
+          log "generate_clips was killed (exit 137). Reducing clip counts and retrying once."
+          CFG_PATH="$cfg_out" python3 - <<'PY'
+import os
+import yaml
+
+cfg_path = os.environ["CFG_PATH"]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+changes = []
+
+def reduce_recursive(obj, key, factor, minimum):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key and isinstance(v, (int, float)):
+                old = int(v)
+                new = max(minimum, int(round(old * factor)))
+                if new < old:
+                    obj[k] = new
+                    changes.append((key, old, new))
+            else:
+                reduce_recursive(v, key, factor, minimum)
+    elif isinstance(obj, list):
+        for item in obj:
+            reduce_recursive(item, key, factor, minimum)
+
+reduce_recursive(cfg, "n_samples", 0.6, 120)
+reduce_recursive(cfg, "n_samples_val", 0.6, 24)
+reduce_recursive(cfg, "steps", 0.7, 600)
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
+if changes:
+    for key, old, new in changes:
+        print(f"Reduced {key}: {old} -> {new}")
+else:
+    print("No reducible keys found in config; retrying with unchanged values")
+PY
+          continue
+        fi
+        return "$rc"
+      done
+      return 1
+    }
+    run_generate_clips
+    python3 - <<PY
+import glob
+import os
+import numpy as np
+import resampy
+import soundfile as sf
+import yaml
+
+cfg_path = "$cfg_out"
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+feature_dir = os.path.join(cfg["output_dir"], cfg["model_name"])
+clip_dirs = [
+    os.path.join(feature_dir, "positive_train"),
+    os.path.join(feature_dir, "positive_test"),
+    os.path.join(feature_dir, "negative_train"),
+    os.path.join(feature_dir, "negative_test"),
+]
+
+processed = 0
+for clip_dir in clip_dirs:
+    for wav_path in glob.glob(os.path.join(clip_dir, "*.wav")):
+        audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+        if isinstance(audio, np.ndarray) and audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        if sr != 16000:
+            audio = resampy.resample(audio, sr, 16000)
+        sf.write(wav_path, audio, 16000, subtype="PCM_16")
+        processed += 1
+
+print(f"Normalized generated clips to mono 16k PCM: {processed}")
+PY
+    python3 - <<'PY'
+import os
+import openwakeword.utils as oww_utils
+
+target = os.path.join(os.getcwd(), "openwakeword", "resources", "models")
+oww_utils.download_models(model_names=["_none_"], target_directory=target)
+print(f"Ensured openWakeWord feature/VAD resources in {target}")
+PY
     python3 openwakeword/train.py --training_config "$cfg_out" --augment_clips
+    python3 - <<PY
+import os
+import numpy as np
+import yaml
+
+cfg_path = "$cfg_out"
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+feature_dir = os.path.join(cfg["output_dir"], cfg["model_name"])
+neg_features = os.path.join(feature_dir, "negative_features_test.npy")
+fp_validation = os.path.join(feature_dir, "false_positive_validation.npy")
+
+if not os.path.exists(neg_features):
+    raise FileNotFoundError(f"Missing generated features: {neg_features}")
+
+arr = np.load(neg_features)
+if arr.ndim == 3:
+    arr = arr.reshape(-1, arr.shape[-1])
+elif arr.ndim != 2:
+    raise ValueError(f"Unexpected feature shape for false-positive validation: {arr.shape}")
+
+np.save(fp_validation, arr.astype(np.float32))
+cfg["false_positive_validation_data_path"] = fp_validation
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
+print(f"Prepared false-positive validation features: {fp_validation} shape={arr.shape}")
+PY
     python3 openwakeword/train.py --training_config "$cfg_out" --train_model
+    if [[ "$model_format" == "tflite" || "$model_format" == "both" ]]; then
+      mapfile -t fallback_onnxes < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+      [[ ${#fallback_onnxes[@]} -gt 0 ]] || die "No ONNX artifacts found for conversion."
+      for onnx_path in "${fallback_onnxes[@]}"; do
+        [[ -f "$onnx_path" ]] || continue
+        convert_onnx_with_onnx2tf "$onnx_path" "$run_dir"
+      done
+    fi
   ) 2>&1 | tee -a "$log_file"
 
   mapfile -t tflites < <(find "$run_dir" "$repo_dir" -type f -name "*.tflite" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)

@@ -1,6 +1,6 @@
 # Wakeword Training - Docker Workflow
 
-This project is Docker-first. Local host bootstrap scripts are intentionally removed from the primary workflow.
+This project is Docker-first and optimized for repeatable, end-to-end training runs.
 
 ## Services
 
@@ -9,102 +9,97 @@ This project is Docker-first. Local host bootstrap scripts are intentionally rem
 - `piper` (Wyoming Piper TTS)
 - `openwakeword` (Wyoming openWakeWord server)
 - `trainer` (training runtime)
-- `web-wizard` (optional Flask UI profile)
+- `web-wizard` (optional Flask UI)
 
-## Primary CLI
+## Entry points
 
-Use `docker-train.sh` as the main training entrypoint.
+- Linux/macOS: `./docker-train.sh`
+- Windows PowerShell: `./docker-train.ps1`
 
-### Show available devices
-
-```bash
-./docker-train.sh --list-devices
-```
-
-### Train for Atom Echo
+## End-to-end run (Theodora, 4 threads)
 
 ```bash
 ./docker-train.sh \
-  --wake-phrase "Argus" \
-  --device atom_echo \
-  --generate-samples
-```
-
-### Train with explicit settings
-
-```bash
-./docker-train.sh \
-  --wake-phrase "Jarvis" \
-  --profile medium \
-  --threads 2 \
+  --wake-phrase "Theodora" \
+  --device esphome_generic \
+  --threads 4 \
   --format tflite
 ```
 
-## Common Device Settings
+PowerShell equivalent:
 
-Recommended starting points for common targets:
-
-| Device / Target | Recommended `--device` | Format | Profile | Threads | Size Target | Example |
-|---|---|---|---|---:|---:|---|
-| Anki Vector (wire-pod) | `anki_vector_wirepod` | `tflite` | `tiny` | 2 | <=100 KB | `./docker-train.sh --wake-phrase "Vector" --device anki_vector_wirepod` |
-| ReSpeaker XVF3800 | `respeaker_xvf3800` | `tflite` | `tiny` | 2 | <=50 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_xvf3800` |
-| ReSpeaker 2-Mics Pi HAT | `respeaker_2mic_pi_hat` | `tflite` | `tiny` | 2 | <=100 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_2mic_pi_hat` |
-| ReSpeaker 4-Mics Pi HAT | `respeaker_4mic_pi_hat` | `tflite` | `tiny` | 2 | <=150 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_4mic_pi_hat` |
-| Atom Echo (M5Stack) | `atom_echo` | `tflite` | `tiny` | 2 | <=80 KB | `./docker-train.sh --wake-phrase "Argus" --device atom_echo --generate-samples` |
-| Home Assistant Voice (ESPHome-based) | `esphome_generic` | `tflite` | `tiny` | 2 | <=50 KB | `./docker-train.sh --wake-phrase "Hey Home" --device esphome_generic` |
-| Home Assistant server (Wyoming openWakeWord on host) | `custom_manual` | `tflite` | `medium` | 2-4 | <=200 KB | `./docker-train.sh --wake-phrase "Hey Home" --device custom_manual --profile medium --threads 4 --format tflite` |
-
-### Rebuild image first
-
-```bash
-./docker-train.sh --build --wake-phrase "Computer" --device esphome_generic
+```powershell
+./docker-train.ps1 --wake-phrase "Theodora" --device esphome_generic --threads 4 --format tflite
 ```
 
-### Open trainer shell
+## Optional sample generation
 
 ```bash
+./docker-train.sh \
+  --wake-phrase "Theodora" \
+  --generate-samples \
+  --positives 240 \
+  --negatives 240
+```
+
+Generated positives are stored per wakeword in `wakeword_lab/data/positives/<wakeword_slug>/` and use highest-quality available local TTS voices (novelty voices excluded) plus speech variants.
+Generated negatives are pooled in `wakeword_lab/data/negatives/`, append-only, and include both non-speech and speech (diverse voices + diverse non-wake phrases).
+
+Host prerequisites for `--generate-samples`:
+
+- `ffmpeg`
+- local TTS backend (`espeak-ng`/`espeak` on Linux, `say` on macOS, or Windows PowerShell speech synthesis)
+
+The generator replaces previous positives only for the current wakeword folder, and appends only new uniquely indexed negatives.
+Each run adds at least 50 new negatives, even if `--negatives` is set lower.
+
+## Stability/performance guards
+
+- Service health checks fail fast with logs if stack readiness times out.
+- Input negatives are normalized to mono 16k PCM for augmentation stability.
+- `tiny` profile defaults now cap manifest size lower to avoid memory spikes on smaller machines.
+- Clip generation auto-retries once with reduced counts when the first attempt is OOM-killed.
+- TFLite conversion uses `onnx2tf` with a cached converter venv to reduce repeat-run time.
+- Runtime patching fixes known upstream `openwakeword/train.py` default-flag behavior.
+
+## Utility commands
+
+```bash
+# list device presets
+./docker-train.sh --list-devices
+
+# rebuild image
+./docker-train.sh --build --wake-phrase "Theodora" --device esphome_generic
+
+# trainer shell
 ./docker-train.sh --shell
-```
 
-## Web Wizard (optional)
-
-```bash
-docker compose --profile web up -d web-wizard
-```
-
-Open [http://localhost:5000](http://localhost:5000)
-
-## Outputs and Data
-
-- Models: `./wakeword_lab/custom_models/`
-- Input data: `./wakeword_lab/data/positives/` and `./wakeword_lab/data/negatives/`
-- Training logs/runs: Docker volume `training-workspace`
-
-## Stop Stack
-
-```bash
+# stop stack
 docker compose down
 ```
 
+## Outputs
+
+- Models: `wakeword_lab/custom_models/`
+- Input data: `wakeword_lab/data/positives/` and `wakeword_lab/data/negatives/`
+- Training runs/logs: Docker volume `training-workspace` (`/workspace/training_runs` in container)
+
 ## Troubleshooting
 
-### Docker daemon not running
-
-Start Docker Desktop and rerun:
+### Docker daemon unavailable
 
 ```bash
 docker info
 ```
 
-### Services not healthy
+### Health checks fail
 
 ```bash
 docker compose ps
-docker compose logs piper
-docker compose logs openwakeword
+docker compose logs --tail=120 piper openwakeword
 ```
 
-### Clean stale resources
+### Reset stack state
 
 ```bash
 docker compose down -v
