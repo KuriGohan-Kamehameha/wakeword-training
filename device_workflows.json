@@ -6,6 +6,7 @@
     ],
     "default_format": "tflite",
     "profile": "medium",
+    "max_filesize_kb": 200,
     "threads": 1,
     "piper_host": "kulfi.local",
     "piper_port": 10200,
@@ -22,6 +23,7 @@
       ],
       "default_format": "tflite",
       "profile": "tiny",
+      "max_filesize_kb": 50,
       "threads": 2,
       "notes": "Use .tflite for on-device wake word. Copy into your firmware or wyoming-openwakeword custom-model-dir."
     },
@@ -33,6 +35,7 @@
       ],
       "default_format": "tflite",
       "profile": "tiny",
+      "max_filesize_kb": 100,
       "threads": 2,
       "notes": "Use .tflite and serve via wyoming-openwakeword or on-device runtime."
     },
@@ -44,6 +47,7 @@
       ],
       "default_format": "tflite",
       "profile": "tiny",
+      "max_filesize_kb": 150,
       "threads": 2,
       "notes": "Use .tflite and serve via wyoming-openwakeword or on-device runtime."
     },
@@ -55,6 +59,7 @@
       ],
       "default_format": "tflite",
       "profile": "tiny",
+      "max_filesize_kb": 50,
       "threads": 2,
       "notes": "ESPHome wake word components expect .tflite models."
     },
@@ -66,6 +71,7 @@
       ],
       "default_format": "tflite",
       "profile": "tiny",
+      "max_filesize_kb": 100,
       "threads": 2,
       "notes": "Wire-pod supports custom wake words via openWakeWord. Provide the .tflite in your wire-pod custom model directory."
     },
@@ -78,6 +84,7 @@
       ],
       "default_format": "tflite",
       "profile": "medium",
+      "max_filesize_kb": 500,
       "threads": 1,
       "notes": "Manual selection. Choose format and profile for your target." 
     }
