@@ -209,8 +209,19 @@ __marimo__/
 # WakeWord Training Project
 .DS_Store
 wakeword_lab/venv/
-wakeword_lab/data/positives/*.wav
-wakeword_lab/data/negatives/*.wav
+wakeword_lab/data/positives/**/*.wav
+wakeword_lab/data/negatives/**/*.wav
+wakeword_lab/data/hard_negatives/**/*.wav
+wakeword_lab/data/piper_voices/
+wakeword_lab/data/services/
+wakeword_lab/data/custom_models/
+wakeword_lab/data/training_runs/
+wakeword_lab/data/logs/
+wakeword_lab/data/evaluation/
+wakeword_lab/data/**/*.npy
+wakeword_lab/data/**/*.onnx
+wakeword_lab/data/**/*.tflite
+wakeword_lab/data/**/*.json
 wakeword_lab/logs/
 wakeword_lab/training_runs/
 **/dummy_model.tflite

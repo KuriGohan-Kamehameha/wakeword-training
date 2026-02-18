@@ -47,6 +47,7 @@ RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel && \
     torchaudio==2.8.0 \
     espeak-phonemizer \
     piper-tts \
+    pathvalidate \
     flask \
     torchinfo \
     torchmetrics \
@@ -70,7 +71,7 @@ RUN chmod +x trainer.sh docker-train.sh generate_dataset.py generate_training_sa
 
 # Set environment variables
 ENV PYTHONPATH=/workspace/openWakeWord_upstream
-ENV BASE_DIR=/workspace
+ENV BASE_DIR=/workspace/data
 ENV OWW_REPO_DIR=/workspace/openWakeWord_upstream
 ENV PATH=/usr/local/bin:${PATH}
 

@@ -6,6 +6,7 @@ IFS=$'\n\t'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKFLOWS_JSON="$SCRIPT_DIR/device_workflows.json"
+ORIG_ARGC=$#
 
 # Defaults
 WAKE_PHRASE="${WAKE_PHRASE:-hey assistant}"
@@ -31,6 +32,7 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Train a wake word using the Docker Compose stack.
+Run with no options to use interactive mode.
 
 Options:
   --wake-phrase TEXT      Wake phrase to train (default: "hey assistant")
@@ -57,6 +59,13 @@ USAGE
 die() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+trim() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
 }
 
 require_cmd() {
@@ -136,6 +145,174 @@ PY
   done <<< "$output"
 }
 
+device_exists() {
+  local device_id="${1:?}"
+  [[ -f "$WORKFLOWS_JSON" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  python3 - "$WORKFLOWS_JSON" "$device_id" <<'PY' >/dev/null 2>&1
+import json,sys
+path,device_id=sys.argv[1],sys.argv[2]
+with open(path,'r',encoding='utf-8') as f:
+    data=json.load(f)
+ids={d.get('id') for d in data.get('devices',[]) if d.get('id')}
+sys.exit(0 if device_id in ids else 1)
+PY
+}
+
+prompt_default() {
+  local __var="${1:?}" prompt="${2:?}" default="${3-}" input
+  read -r -p "$prompt [$default]: " input || input=""
+  input="$(trim "$input")"
+  if [[ -z "$input" ]]; then
+    input="$default"
+  fi
+  printf -v "$__var" '%s' "$input"
+}
+
+prompt_int() {
+  local __var="${1:?}" prompt="${2:?}" default="${3:?}" input
+  while true; do
+    read -r -p "$prompt [$default]: " input || input=""
+    input="$(trim "$input")"
+    if [[ -z "$input" ]]; then
+      input="$default"
+    fi
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+      printf -v "$__var" '%s' "$input"
+      return 0
+    fi
+    echo "Please enter a non-negative integer."
+  done
+}
+
+prompt_choice() {
+  local __var="${1:?}" prompt="${2:?}" default="${3:?}" input options_display valid opt
+  shift 3
+  local options=("$@")
+  options_display="$(IFS='/'; echo "${options[*]}")"
+
+  while true; do
+    read -r -p "$prompt [$options_display] (default: $default): " input || input=""
+    input="$(trim "$input")"
+    if [[ -z "$input" ]]; then
+      input="$default"
+    fi
+
+    valid=0
+    for opt in "${options[@]}"; do
+      if [[ "$input" == "$opt" ]]; then
+        valid=1
+        break
+      fi
+    done
+
+    if [[ "$valid" -eq 1 ]]; then
+      printf -v "$__var" '%s' "$input"
+      return 0
+    fi
+
+    echo "Invalid choice: $input"
+  done
+}
+
+prompt_yes_no() {
+  local __var="${1:?}" prompt="${2:?}" default="${3:?}" default_hint input
+
+  case "$default" in
+    y|Y|yes|YES|Yes)
+      default="y"
+      default_hint="Y/n"
+      ;;
+    n|N|no|NO|No)
+      default="n"
+      default_hint="y/N"
+      ;;
+    *)
+      die "Internal error: prompt_yes_no default must be y or n"
+      ;;
+  esac
+
+  while true; do
+    read -r -p "$prompt [$default_hint]: " input || input=""
+    input="$(trim "$input")"
+    if [[ -z "$input" ]]; then
+      input="$default"
+    fi
+
+    case "$input" in
+      y|Y|yes|YES|Yes)
+        printf -v "$__var" '1'
+        return 0
+        ;;
+      n|N|no|NO|No)
+        printf -v "$__var" '0'
+        return 0
+        ;;
+      *)
+        echo "Please answer y or n."
+        ;;
+    esac
+  done
+}
+
+interactive_wizard() {
+  local device_input generate_default build_default shell_default
+
+  echo "No options supplied; entering interactive mode."
+  echo
+
+  prompt_default WAKE_PHRASE "Wake phrase" "$WAKE_PHRASE"
+
+  if [[ -f "$WORKFLOWS_JSON" ]] && command -v python3 >/dev/null 2>&1; then
+    echo
+    echo "Available devices:"
+    list_devices
+    echo
+
+    while true; do
+      read -r -p "Device ID (leave empty for none): " device_input || device_input=""
+      device_input="$(trim "$device_input")"
+
+      if [[ -z "$device_input" ]]; then
+        DEVICE_ID=""
+        break
+      fi
+
+      if device_exists "$device_input"; then
+        DEVICE_ID="$device_input"
+        break
+      fi
+
+      echo "Unknown device ID: $device_input"
+    done
+  fi
+
+  echo
+  prompt_choice TRAIN_PROFILE "Training profile" "$TRAIN_PROFILE" tiny medium large
+  prompt_int TRAIN_THREADS "CPU threads" "$TRAIN_THREADS"
+  prompt_choice MODEL_FORMAT "Model format" "$MODEL_FORMAT" tflite onnx both
+
+  echo
+  generate_default="n"
+  [[ "$GENERATE_SAMPLES" -eq 1 ]] && generate_default="y"
+  prompt_yes_no GENERATE_SAMPLES "Generate synthetic training samples?" "$generate_default"
+  if [[ "$GENERATE_SAMPLES" -eq 1 ]]; then
+    prompt_int NUM_POSITIVES "Positive samples to generate" "$NUM_POSITIVES"
+    prompt_int NUM_NEGATIVES "Negative samples to generate" "$NUM_NEGATIVES"
+  fi
+
+  echo
+  build_default="n"
+  [[ "$BUILD" -eq 1 ]] && build_default="y"
+  prompt_yes_no BUILD "Rebuild Docker images first?" "$build_default"
+
+  shell_default="n"
+  [[ "$SHELL_MODE" -eq 1 ]] && shell_default="y"
+  prompt_yes_no SHELL_MODE "Open shell in trainer container instead of training?" "$shell_default"
+  echo
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wake-phrase)
@@ -196,6 +373,12 @@ done
 
 cd "$SCRIPT_DIR"
 
+if [[ "$ORIG_ARGC" -eq 0 && -t 0 ]]; then
+  interactive_wizard
+elif [[ "$ORIG_ARGC" -eq 0 ]]; then
+  echo "No options supplied and no interactive TTY detected; using defaults."
+fi
+
 if [[ "$LIST_DEVICES" -eq 1 ]]; then
   list_devices
   exit 0
@@ -216,11 +399,18 @@ require_docker_daemon
 
 echo "=== Wakeword Training Docker Stack ==="
 
+echo "Pulling latest runtime images before this run..."
+docker compose pull piper openwakeword
+echo
+
 if [[ "$BUILD" -eq 1 ]]; then
-  echo "Building Docker images..."
-  docker compose build
-  echo
+  echo "Rebuilding trainer image with fresh base layers (no cache)..."
+  docker compose build --pull --no-cache trainer
+else
+  echo "Refreshing trainer image base layers..."
+  docker compose build --pull trainer
 fi
+echo
 
 echo "Starting services..."
 docker compose up -d piper openwakeword
@@ -258,10 +448,15 @@ if [[ "$SHELL_MODE" -eq 1 ]]; then
 fi
 
 if [[ "$GENERATE_SAMPLES" -eq 1 ]]; then
-  require_cmd python3
-  echo "Generating synthetic samples..."
-  python3 generate_training_samples.py \
+  echo "Generating synthetic samples (Piper voices only)..."
+  docker compose run --rm \
+    -e WYOMING_PIPER_HOST=piper \
+    -e WYOMING_PIPER_PORT=10200 \
+    -e WYOMING_OPENWAKEWORD_HOST=openwakeword \
+    -e WYOMING_OPENWAKEWORD_PORT=10400 \
+    trainer python3 generate_training_samples.py \
     --wake-phrase "$WAKE_PHRASE" \
+    --data-dir /workspace/data \
     --positives "$NUM_POSITIVES" \
     --negatives "$NUM_NEGATIVES"
   echo
@@ -282,6 +477,8 @@ CMD=(
   --non-interactive
   --no-tmux
   --allow-low-disk
+  --base-dir /workspace/data
+  --data-dir /workspace/data
   --wake-phrase "$WAKE_PHRASE"
   --train-profile "$TRAIN_PROFILE"
   --train-threads "$TRAIN_THREADS"
@@ -299,7 +496,7 @@ EXIT_CODE=$?
 
 echo
 echo "=== Training Complete ==="
-echo "Models: ./wakeword_lab/custom_models/"
+echo "Training data + runs + logs + models: ./wakeword_lab/data/"
 echo "Stop stack: docker compose down"
 
 exit "$EXIT_CODE"
