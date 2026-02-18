@@ -564,10 +564,38 @@ PY
   [[ -f "$cfg_in" ]] || die "Expected training template missing: $cfg_in"
   cp -f "$cfg_in" "$cfg_out"
 
-  local piper_generator_dir="${PIPER_SAMPLE_GENERATOR_DIR:-/app/piper-sample-generator}"
-  if [[ ! -f "$piper_generator_dir/generate_samples.py" ]]; then
-    log "WARNING: piper sample generator not found at $piper_generator_dir"
+  local piper_generator_dir_src="${PIPER_SAMPLE_GENERATOR_DIR:-/app/piper-sample-generator}"
+  local piper_generator_dir="$run_dir/piper-sample-generator-runtime"
+  mkdir -p "$piper_generator_dir"
+  if [[ -d "$piper_generator_dir_src" ]]; then
+    cp -a "$piper_generator_dir_src/." "$piper_generator_dir/"
+  else
+    log "WARNING: piper sample generator source directory not found at $piper_generator_dir_src"
   fi
+
+  local piper_gen_py="$piper_generator_dir/generate_samples.py"
+  if [[ -f "$piper_gen_py" ]]; then
+    PIPER_GEN_PY="$piper_gen_py" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["PIPER_GEN_PY"])
+text = path.read_text(encoding="utf-8")
+needle = "model = torch.load(model_path)"
+patched = "model = torch.load(model_path, weights_only=False)"
+
+if patched in text:
+    print("piper generate_samples.py patch already present")
+elif needle in text:
+    path.write_text(text.replace(needle, patched, 1), encoding="utf-8")
+    print("Patched piper generate_samples.py for PyTorch>=2.6 compatibility")
+else:
+    print("WARNING: Could not locate expected torch.load() call in piper generate_samples.py")
+PY
+  else
+    log "WARNING: piper sample generator entrypoint not found at $piper_gen_py"
+  fi
+
   local piper_model_file="$piper_generator_dir/models/en-us-libritts-high.pt"
   [[ -f "$piper_model_file" ]] || die "Missing Piper generator model file: $piper_model_file"
 

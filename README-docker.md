@@ -16,6 +16,12 @@ This project is Docker-first and optimized for repeatable, end-to-end training r
 - Linux/macOS: `./docker-train.sh`
 - Windows PowerShell: `./docker-train.ps1`
 
+Before first run, initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
 ## End-to-end run (Theodora, 4 threads)
 
 ```bash

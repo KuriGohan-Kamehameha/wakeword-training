@@ -4,6 +4,7 @@
    - `python3 -m py_compile *.py`
    - `bash -n docker-train.sh trainer.sh`
    - `docker compose config`
+   - `git submodule status` (no dirty submodule state)
 2. Verify sample generation smoke test:
    - `docker compose run --rm trainer python3 generate_training_samples.py --wake-phrase "release check" --data-dir /workspace/data --positives 1 --negatives 0 --piper-max-voices 1`
 3. Verify persistence paths on host:
