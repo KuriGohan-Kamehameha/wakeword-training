@@ -26,7 +26,7 @@ WORKDIR /app
 RUN mkdir -p /workspace /workspace/custom_models /workspace/data
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel && \
     pip install --no-cache-dir \
     pyyaml \
     numpy \
@@ -41,11 +41,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     onnxscript \
     datasets \
     speechbrain \
-    torch \
-    torchaudio \
+    torch==2.8.0 \
+    torchaudio==2.8.0 \
     piper-tts \
     flask \
-    setuptools \
     torchinfo \
     torchmetrics \
     pronouncing \

@@ -24,6 +24,20 @@ Artifacts are written to:
 
 - `./wakeword_lab/custom_models/`
 
+## Recommended Device Settings
+
+Use these as practical starting points. Adjust after testing.
+
+| Device / Target | Recommended `--device` | Format | Profile | Threads | Size Target | Example |
+|---|---|---|---|---:|---:|---|
+| Anki Vector (wire-pod) | `anki_vector_wirepod` | `tflite` | `tiny` | 2 | <=100 KB | `./docker-train.sh --wake-phrase "Vector" --device anki_vector_wirepod --generate-samples` |
+| ReSpeaker XVF3800 | `respeaker_xvf3800` | `tflite` | `tiny` | 2 | <=50 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_xvf3800` |
+| ReSpeaker 2-Mics Pi HAT | `respeaker_2mic_pi_hat` | `tflite` | `tiny` | 2 | <=100 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_2mic_pi_hat` |
+| ReSpeaker 4-Mics Pi HAT | `respeaker_4mic_pi_hat` | `tflite` | `tiny` | 2 | <=150 KB | `./docker-train.sh --wake-phrase "Computer" --device respeaker_4mic_pi_hat` |
+| Atom Echo (M5Stack) | `atom_echo` | `tflite` | `tiny` | 2 | <=80 KB | `./docker-train.sh --wake-phrase "Argus" --device atom_echo --generate-samples` |
+| Home Assistant Voice (ESPHome-based) | `esphome_generic` | `tflite` | `tiny` | 2 | <=50 KB | `./docker-train.sh --wake-phrase "Hey Home" --device esphome_generic --generate-samples` |
+| Home Assistant server (Wyoming openWakeWord on host) | `custom_manual` | `tflite` | `medium` | 2-4 | <=200 KB | `./docker-train.sh --wake-phrase "Hey Home" --device custom_manual --profile medium --threads 4 --format tflite` |
+
 ## Common Commands
 
 ```bash
