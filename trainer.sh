@@ -3,243 +3,63 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0-docker"
 
-# ------------------------------
-# Usage
-# ------------------------------
 usage() {
-  cat <<EOF
+  cat <<USAGE
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+Docker-first wakeword trainer.
 
 Usage:
   ${SCRIPT_NAME} [options]
 
 Options:
-  --destination PATH         Base workspace directory (overrides BASE_DIR).
-  --base-dir PATH            Alias for --destination.
+  --destination PATH         Base workspace directory (alias: --base-dir).
+  --base-dir PATH            Base workspace directory.
   --runs-dir PATH            Overrides RUNS_DIR.
   --logs-dir PATH            Overrides LOGS_DIR.
-  --venv-dir PATH            Overrides VENV_DIR.
-  --oww-repo-dir PATH         Overrides OWW_REPO_DIR.
-  --custom-models-dir PATH    Overrides CUSTOM_MODELS_DIR.
-  --min-free-disk-gb NUMBER  Overrides MIN_FREE_DISK_GB.
-  --allow-low-disk           Proceed even if free disk is below the minimum.
-  --install-optional-apt 0|1 Overrides INSTALL_OPTIONAL_APT.
-  --wake-phrase TEXT         Overrides WAKE_PHRASE.
-  --train-profile NAME       Overrides TRAIN_PROFILE (tiny|medium|large).
-  --train-threads NUMBER     Overrides TRAIN_THREADS.
-  --model-format NAME        Overrides MODEL_FORMAT (tflite|onnx|both).
-  --wyoming-piper-host HOST  Overrides WYOMING_PIPER_HOST.
-  --wyoming-piper-port PORT  Overrides WYOMING_PIPER_PORT.
-  --wyoming-oww-host HOST    Overrides WYOMING_OPENWAKEWORD_HOST.
-  --wyoming-oww-port PORT    Overrides WYOMING_OPENWAKEWORD_PORT.
-  --umask MASK               Overrides UMASK (e.g., 022).
-  --non-interactive          Skip all prompts; use defaults or env vars.
-  --no-tmux                  Run training in current shell (no tmux session).
-  --help, -h                 Show this help and exit.
+  --oww-repo-dir PATH        Overrides OWW_REPO_DIR.
+  --custom-models-dir PATH   Overrides CUSTOM_MODELS_DIR.
+  --data-dir PATH            Overrides DATA_DIR.
+  --min-free-disk-gb NUMBER  Minimum free disk in GB (default: 2).
+  --allow-low-disk           Continue even when free disk is below minimum.
+  --wake-phrase TEXT         Wake phrase to train.
+  --train-profile NAME       tiny|medium|large.
+  --train-threads NUMBER     CPU threads to use.
+  --model-format NAME        tflite|onnx|both.
+  --wyoming-piper-host HOST  Optional connectivity probe target.
+  --wyoming-piper-port PORT  Optional connectivity probe target.
+  --wyoming-oww-host HOST    Optional connectivity probe target.
+  --wyoming-oww-port PORT    Optional connectivity probe target.
+  --non-interactive          Skip prompts and use defaults.
+  --no-tmux                  Accepted for compatibility (ignored).
+  --help, -h                 Show this help.
 
-Environment overrides (if no flags provided):
-  BASE_DIR, ALLOW_LOW_DISK, MIN_FREE_DISK_GB, RUNS_DIR, LOGS_DIR, VENV_DIR,
-  OWW_REPO_DIR, CUSTOM_MODELS_DIR, TRAIN_PROFILE, TRAIN_THREADS, WAKE_PHRASE,
-  INSTALL_OPTIONAL_APT, MODEL_FORMAT, WYOMING_PIPER_HOST, WYOMING_PIPER_PORT,
-  WYOMING_OPENWAKEWORD_HOST, WYOMING_OPENWAKEWORD_PORT, UMASK.
-EOF
+Environment overrides:
+  BASE_DIR, RUNS_DIR, LOGS_DIR, OWW_REPO_DIR, CUSTOM_MODELS_DIR, DATA_DIR,
+  WAKE_PHRASE, TRAIN_PROFILE, TRAIN_THREADS, MODEL_FORMAT,
+  WYOMING_PIPER_HOST, WYOMING_PIPER_PORT,
+  WYOMING_OPENWAKEWORD_HOST, WYOMING_OPENWAKEWORD_PORT,
+  MAX_POSITIVE_SAMPLES, MAX_NEGATIVE_SAMPLES, MIN_PER_SOURCE, DATASET_SEED,
+  ALLOW_LOW_DISK, MIN_FREE_DISK_GB, NON_INTERACTIVE.
+USAGE
 }
 
-# Parsed CLI values (empty means "not provided")
-CLI_BASE_DIR=""
-CLI_RUNS_DIR=""
-CLI_LOGS_DIR=""
-CLI_VENV_DIR=""
-CLI_OWW_REPO_DIR=""
-CLI_CUSTOM_MODELS_DIR=""
-CLI_MIN_FREE_DISK_GB=""
-CLI_ALLOW_LOW_DISK=0
-CLI_INSTALL_OPTIONAL_APT=""
-CLI_WAKE_PHRASE=""
-CLI_TRAIN_PROFILE=""
-CLI_TRAIN_THREADS=""
-CLI_MODEL_FORMAT=""
-CLI_WYOMING_PIPER_HOST=""
-CLI_WYOMING_PIPER_PORT=""
-CLI_WYOMING_OWW_HOST=""
-CLI_WYOMING_OWW_PORT=""
-CLI_UMASK=""
-CLI_NON_INTERACTIVE=0
-CLI_NO_TMUX=0
-
-# ------------------------------
-# Logging / Error handling
-# ------------------------------
 timestamp_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
-log() {
-  local msg="${1:?}"
-  echo "[$(timestamp_utc)] [$SCRIPT_NAME] $msg" >&2
-}
-
-die() {
-  local msg="${1:?}"
-  echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $msg" >&2
-  exit 1
-}
+log() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] $*" >&2; }
+die() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $*" >&2; exit 1; }
 
 on_err() {
   local exit_code=$?
   local line_no=${1:-"?"}
-  die "Unhandled error at line $line_no (exit=$exit_code). See logs above."
+  die "Unhandled error at line ${line_no} (exit=${exit_code})."
 }
 trap 'on_err $LINENO' ERR
 
-# ------------------------------
-# Platform checks
-# ------------------------------
 require_cmd() {
   local c="${1:?}"
-  command -v "$c" >/dev/null 2>&1 || die "Missing required command: $c"
-}
-
-is_raspberry_pi() {
-  [[ -r /proc/device-tree/model ]] && grep -qi "raspberry pi" /proc/device-tree/model
-}
-
-arch() { uname -m; }
-
-os_id() {
-  [[ -r /etc/os-release ]] || echo "unknown"
-  # shellcheck disable=SC1091
-  . /etc/os-release 2>/dev/null || true
-  echo "${ID:-unknown}"
-}
-
-have_internet_dns() {
-  # Very lightweight sanity check (does not guarantee full connectivity)
-  getent hosts github.com >/dev/null 2>&1
-}
-
-# Bash /dev/tcp port probe (no netcat dependency).
-port_open() {
-  local host="${1:?}"
-  local port="${2:?}"
-  local timeout_s="${3:-1}"
-  # Use Python socket connect with timeout (cross-platform, avoids external 'timeout')
-  python - <<PY >/dev/null 2>&1
-import socket, sys
-s = socket.socket()
-s.settimeout(${timeout_s})
-try:
-    s.connect(("${host}", int(${port})))
-    s.close()
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PY
-}
-
-# ------------------------------
-# APT helpers
-# ------------------------------
-have_sudo() {
-  command -v sudo >/dev/null 2>&1
-}
-
-sudo_maybe() {
-  if [[ ${EUID:-999} -eq 0 ]]; then
-    "$@"
-  else
-    have_sudo || die "Not root and sudo not found. Install sudo or run as root."
-    sudo -n true >/dev/null 2>&1 || sudo -v || die "sudo authentication failed."
-    sudo "$@"
-  fi
-}
-
-apt_pkg_installed() {
-  local pkg="${1:?}"
-  dpkg -s "$pkg" >/dev/null 2>&1
-}
-
-apt_pkg_available() {
-  local pkg="${1:?}"
-  apt-cache show "$pkg" >/dev/null 2>&1
-}
-
-apt_install_many() {
-  local -a pkgs=("$@")
-  [[ ${#pkgs[@]} -gt 0 ]] || return 0
-  sudo_maybe apt-get install -y --no-install-recommends "${pkgs[@]}"
-}
-
-apt_update_once() {
-  local stamp="${1:?}"
-  if [[ ! -f "$stamp" ]]; then
-    log "Running apt-get update ..."
-    sudo_maybe apt-get update -y
-    touch "$stamp"
-  fi
-}
-
-# ------------------------------
-# Input helpers
-# ------------------------------
-prompt_nonempty() {
-  local var_name="${1:?}"
-  local prompt_text="${2:?}"
-  local default_value="${3:?}"
-
-  local value=""
-  if [[ -n "${!var_name:-}" ]]; then
-    value="${!var_name}"
-  else
-    if [[ -t 0 && "$NON_INTERACTIVE" -ne 1 ]]; then
-      read -r -p "${prompt_text} [${default_value}]: " value || true
-      value="${value:-$default_value}"
-    else
-      value="$default_value"
-      [[ "$NON_INTERACTIVE" -eq 1 ]] && log "Non-interactive mode: ${var_name}=${value}"
-    fi
-  fi
-
-  value="$(echo -n "$value" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
-  [[ -n "$value" ]] || die "Input for ${var_name} must not be empty."
-  printf -v "$var_name" '%s' "$value"
-}
-
-prompt_choice() {
-  local var_name="${1:?}"
-  local prompt_text="${2:?}"
-  local default_value="${3:?}"
-  shift 3
-  local -a choices=("$@")
-  [[ ${#choices[@]} -gt 0 ]] || die "prompt_choice requires at least one choice."
-
-  local value=""
-  if [[ -n "${!var_name:-}" ]]; then
-    value="${!var_name}"
-  else
-    if [[ -t 0 && "$NON_INTERACTIVE" -ne 1 ]]; then
-      read -r -p "${prompt_text} [${default_value}] (choices: ${choices[*]}): " value || true
-      value="${value:-$default_value}"
-    else
-      value="$default_value"
-      [[ "$NON_INTERACTIVE" -eq 1 ]] && log "Non-interactive mode: ${var_name}=${value}"
-    fi
-  fi
-
-  local ok=0
-  for c in "${choices[@]}"; do
-    if [[ "$value" == "$c" ]]; then ok=1; break; fi
-  done
-  [[ $ok -eq 1 ]] || die "Invalid choice for ${var_name}: '${value}'. Allowed: ${choices[*]}"
-  printf -v "$var_name" '%s' "$value"
-}
-
-validate_base_dir() {
-  local dir="${1:?}"
-  [[ -n "$dir" ]] || die "Base directory must not be empty."
-  if [[ "$dir" == "/" ]]; then
-    die "Base directory must not be '/'. Set BASE_DIR to a safe path."
-  fi
+  command -v "$c" >/dev/null 2>&1 || die "Missing required command: ${c}"
 }
 
 expand_tilde() {
@@ -254,7 +74,6 @@ expand_tilde() {
 }
 
 slugify() {
-  # Lowercase, keep alnum, convert spaces/dashes to underscore, collapse repeats.
   echo -n "${1:?}" \
     | tr '[:upper:]' '[:lower:]' \
     | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//; s/_+/_/g'
@@ -263,94 +82,105 @@ slugify() {
 require_free_disk_gb() {
   local path="${1:?}"
   local min_gb="${2:?}"
-  require_cmd df
   local avail_kb
   avail_kb="$(df -Pk "$path" | awk 'NR==2 {print $4}')"
-  [[ "$avail_kb" =~ ^[0-9]+$ ]] || die "Could not determine free disk space at $path"
+  [[ "$avail_kb" =~ ^[0-9]+$ ]] || die "Could not determine free disk space at ${path}"
+
   local avail_gb=$(( avail_kb / 1024 / 1024 ))
   if (( avail_gb < min_gb )); then
     if [[ "${ALLOW_LOW_DISK:-0}" == "1" ]]; then
-      log "WARNING: Free disk at $path is ${avail_gb}GB (<${min_gb}GB). Continuing due to ALLOW_LOW_DISK=1."
+      log "WARNING: Free disk at ${path} is ${avail_gb}GB (<${min_gb}GB). Continuing due to ALLOW_LOW_DISK=1."
     else
-      die "Insufficient free disk at $path: ${avail_gb}GB available, need >= ${min_gb}GB. (Override: ALLOW_LOW_DISK=1)"
+      die "Insufficient free disk at ${path}: ${avail_gb}GB available, need >= ${min_gb}GB."
     fi
   fi
 }
 
-# ------------------------------
-# Pip helpers
-# ------------------------------
-pip_install() {
-  # First try prefer-binary to avoid source builds on Pi.
-  local -a pkgs=("$@")
-  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
-    python -m pip install --prefer-binary --no-input --disable-pip-version-check "${pkgs[@]}" || {
-    log "pip prefer-binary failed for: ${pkgs[*]} — retrying without prefer-binary."
-    PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
-      python -m pip install --no-input --disable-pip-version-check "${pkgs[@]}"
-  }
+prompt_nonempty() {
+  local var_name="${1:?}"
+  local prompt_text="${2:?}"
+  local default_value="${3:?}"
+
+  local value="${!var_name:-}"
+  if [[ -z "$value" ]]; then
+    if [[ -t 0 && "${NON_INTERACTIVE:-0}" -ne 1 ]]; then
+      read -r -p "${prompt_text} [${default_value}]: " value || true
+      value="${value:-$default_value}"
+    else
+      value="$default_value"
+    fi
+  fi
+
+  value="$(echo -n "$value" | sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
+  [[ -n "$value" ]] || die "Input for ${var_name} must not be empty."
+  printf -v "$var_name" '%s' "$value"
 }
 
-python_import_check() {
-  local mod="${1:?}"
-  python - <<PY
-import importlib, sys
-m = "${mod}"
+prompt_choice() {
+  local var_name="${1:?}"
+  local prompt_text="${2:?}"
+  local default_value="${3:?}"
+  shift 3
+  local -a choices=("$@")
+
+  local value="${!var_name:-}"
+  if [[ -z "$value" ]]; then
+    if [[ -t 0 && "${NON_INTERACTIVE:-0}" -ne 1 ]]; then
+      read -r -p "${prompt_text} [${default_value}] (choices: ${choices[*]}): " value || true
+      value="${value:-$default_value}"
+    else
+      value="$default_value"
+    fi
+  fi
+
+  local ok=0
+  for c in "${choices[@]}"; do
+    if [[ "$value" == "$c" ]]; then
+      ok=1
+      break
+    fi
+  done
+  [[ "$ok" -eq 1 ]] || die "Invalid choice for ${var_name}: '${value}'. Allowed: ${choices[*]}"
+  printf -v "$var_name" '%s' "$value"
+}
+
+port_open() {
+  local host="${1:?}"
+  local port="${2:?}"
+  local timeout_s="${3:-1}"
+  python3 - <<PY >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(${timeout_s})
 try:
-    importlib.import_module(m)
-except Exception as e:
-    print(f"IMPORT_FAIL {m}: {e}", file=sys.stderr)
-    sys.exit(2)
-print(f"IMPORT_OK {m}")
+    s.connect(("${host}", int(${port})))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
 PY
 }
 
-install_tflite_runtime_if_available() {
-  log "Checking availability of tflite-runtime..."
+# CLI placeholders
+CLI_BASE_DIR=""
+CLI_RUNS_DIR=""
+CLI_LOGS_DIR=""
+CLI_OWW_REPO_DIR=""
+CLI_CUSTOM_MODELS_DIR=""
+CLI_DATA_DIR=""
+CLI_MIN_FREE_DISK_GB=""
+CLI_ALLOW_LOW_DISK=0
+CLI_WAKE_PHRASE=""
+CLI_TRAIN_PROFILE=""
+CLI_TRAIN_THREADS=""
+CLI_MODEL_FORMAT=""
+CLI_WYOMING_PIPER_HOST=""
+CLI_WYOMING_PIPER_PORT=""
+CLI_WYOMING_OWW_HOST=""
+CLI_WYOMING_OWW_PORT=""
+CLI_NON_INTERACTIVE=0
+CLI_NO_TMUX=0
 
-  # Case 1: Already importable (someone installed it earlier)
-  if python - <<'EOF' >/dev/null 2>&1
-import tflite_runtime.interpreter
-EOF
-  then
-    log "tflite-runtime already importable; skipping install."
-    return 0
-  fi
-
-  # Check if we're in Docker - skip APT in containers
-  local in_docker=0
-  [[ -f "/.dockerenv" ]] && in_docker=1
-  
-  # Case 2: Available via APT (preferred on Raspberry Pi) - skip in Docker
-  if [[ $in_docker -eq 0 ]] && command -v apt-cache >/dev/null 2>&1 && apt-cache show python3-tflite-runtime >/dev/null 2>&1; then
-    if ! dpkg -s python3-tflite-runtime >/dev/null 2>&1; then
-      log "Installing tflite-runtime via APT (python3-tflite-runtime)..."
-      sudo_maybe apt-get install -y --no-install-recommends python3-tflite-runtime
-    else
-      log "python3-tflite-runtime already installed via APT."
-    fi
-
-    # Verify
-    if python - <<'EOF' >/dev/null 2>&1
-import tflite_runtime.interpreter
-EOF
-    then
-      log "tflite-runtime usable after APT install."
-      return 0
-    else
-      log "WARNING: python3-tflite-runtime installed but not importable."
-      return 1
-    fi
-  fi
-
-  # Case 3: Not available → explicitly skip
-  log "tflite-runtime not available for this OS/Python/arch; skipping (OK for training)."
-  return 0
-}
-
-# ------------------------------
-# Main
-# ------------------------------
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -363,15 +193,11 @@ parse_args() {
         shift
         ;;
       --base-dir|--destination)
-        [[ -n "${2:-}" ]] || die "--destination requires a path."
+        [[ -n "${2:-}" ]] || die "$1 requires a path."
         CLI_BASE_DIR="$2"
         shift 2
         ;;
-      --base-dir=*)
-        CLI_BASE_DIR="${1#*=}"
-        shift
-        ;;
-      --destination=*)
+      --base-dir=*|--destination=*)
         CLI_BASE_DIR="${1#*=}"
         shift
         ;;
@@ -393,15 +219,6 @@ parse_args() {
         CLI_LOGS_DIR="${1#*=}"
         shift
         ;;
-      --venv-dir)
-        [[ -n "${2:-}" ]] || die "--venv-dir requires a path."
-        CLI_VENV_DIR="$2"
-        shift 2
-        ;;
-      --venv-dir=*)
-        CLI_VENV_DIR="${1#*=}"
-        shift
-        ;;
       --oww-repo-dir)
         [[ -n "${2:-}" ]] || die "--oww-repo-dir requires a path."
         CLI_OWW_REPO_DIR="$2"
@@ -420,6 +237,15 @@ parse_args() {
         CLI_CUSTOM_MODELS_DIR="${1#*=}"
         shift
         ;;
+      --data-dir)
+        [[ -n "${2:-}" ]] || die "--data-dir requires a path."
+        CLI_DATA_DIR="$2"
+        shift 2
+        ;;
+      --data-dir=*)
+        CLI_DATA_DIR="${1#*=}"
+        shift
+        ;;
       --min-free-disk-gb)
         [[ -n "${2:-}" ]] || die "--min-free-disk-gb requires a number."
         CLI_MIN_FREE_DISK_GB="$2"
@@ -427,15 +253,6 @@ parse_args() {
         ;;
       --min-free-disk-gb=*)
         CLI_MIN_FREE_DISK_GB="${1#*=}"
-        shift
-        ;;
-      --install-optional-apt)
-        [[ -n "${2:-}" ]] || die "--install-optional-apt requires 0 or 1."
-        CLI_INSTALL_OPTIONAL_APT="$2"
-        shift 2
-        ;;
-      --install-optional-apt=*)
-        CLI_INSTALL_OPTIONAL_APT="${1#*=}"
         shift
         ;;
       --wake-phrase)
@@ -510,15 +327,6 @@ parse_args() {
         CLI_WYOMING_OWW_PORT="${1#*=}"
         shift
         ;;
-      --umask)
-        [[ -n "${2:-}" ]] || die "--umask requires a value."
-        CLI_UMASK="$2"
-        shift 2
-        ;;
-      --umask=*)
-        CLI_UMASK="${1#*=}"
-        shift
-        ;;
       --non-interactive)
         CLI_NON_INTERACTIVE=1
         shift
@@ -532,7 +340,7 @@ parse_args() {
         break
         ;;
       *)
-        die "Unknown argument: $1. Use --help for usage."
+        die "Unknown argument: $1"
         ;;
     esac
   done
@@ -541,376 +349,132 @@ parse_args() {
 main() {
   parse_args "$@"
 
-  if [[ -n "$CLI_BASE_DIR" ]]; then
-    BASE_DIR="$CLI_BASE_DIR"
-  fi
-  if [[ "$CLI_ALLOW_LOW_DISK" -eq 1 ]]; then
-    ALLOW_LOW_DISK=1
-  fi
-  if [[ -n "$CLI_MIN_FREE_DISK_GB" ]]; then
-    MIN_FREE_DISK_GB="$CLI_MIN_FREE_DISK_GB"
-  fi
-  if [[ -n "$CLI_RUNS_DIR" ]]; then
-    RUNS_DIR="$CLI_RUNS_DIR"
-  fi
-  if [[ -n "$CLI_LOGS_DIR" ]]; then
-    LOGS_DIR="$CLI_LOGS_DIR"
-  fi
-  if [[ -n "$CLI_VENV_DIR" ]]; then
-    VENV_DIR="$CLI_VENV_DIR"
-  fi
-  if [[ -n "$CLI_OWW_REPO_DIR" ]]; then
-    OWW_REPO_DIR="$CLI_OWW_REPO_DIR"
-  fi
-  if [[ -n "$CLI_CUSTOM_MODELS_DIR" ]]; then
-    CUSTOM_MODELS_DIR="$CLI_CUSTOM_MODELS_DIR"
-  fi
-  if [[ -n "$CLI_INSTALL_OPTIONAL_APT" ]]; then
-    INSTALL_OPTIONAL_APT="$CLI_INSTALL_OPTIONAL_APT"
-  fi
-  if [[ -n "$CLI_WAKE_PHRASE" ]]; then
-    WAKE_PHRASE="$CLI_WAKE_PHRASE"
-  fi
-  if [[ -n "$CLI_TRAIN_PROFILE" ]]; then
-    TRAIN_PROFILE="$CLI_TRAIN_PROFILE"
-  fi
-  if [[ -n "$CLI_TRAIN_THREADS" ]]; then
-    TRAIN_THREADS="$CLI_TRAIN_THREADS"
-  fi
-  if [[ -n "$CLI_MODEL_FORMAT" ]]; then
-    MODEL_FORMAT="$CLI_MODEL_FORMAT"
-  fi
-  if [[ -n "$CLI_WYOMING_PIPER_HOST" ]]; then
-    WYOMING_PIPER_HOST="$CLI_WYOMING_PIPER_HOST"
-  fi
-  if [[ -n "$CLI_WYOMING_PIPER_PORT" ]]; then
-    WYOMING_PIPER_PORT="$CLI_WYOMING_PIPER_PORT"
-  fi
-  if [[ -n "$CLI_WYOMING_OWW_HOST" ]]; then
-    WYOMING_OPENWAKEWORD_HOST="$CLI_WYOMING_OWW_HOST"
-  fi
-  if [[ -n "$CLI_WYOMING_OWW_PORT" ]]; then
-    WYOMING_OPENWAKEWORD_PORT="$CLI_WYOMING_OWW_PORT"
-  fi
-  if [[ -n "$CLI_UMASK" ]]; then
-    UMASK="$CLI_UMASK"
-  fi
-  
-  # Initialize NON_INTERACTIVE from CLI or environment (default to 0)
-  if [[ "$CLI_NON_INTERACTIVE" -eq 1 ]]; then
-    NON_INTERACTIVE=1
-  else
-    NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
-  fi
-  
-  # Initialize NO_TMUX from CLI or environment (default to 0)
-  if [[ "$CLI_NO_TMUX" -eq 1 ]]; then
-    NO_TMUX=1
-  else
-    NO_TMUX="${NO_TMUX:-0}"
-  fi
+  # Apply CLI overrides to env-backed values.
+  [[ -n "$CLI_BASE_DIR" ]] && BASE_DIR="$CLI_BASE_DIR"
+  [[ -n "$CLI_RUNS_DIR" ]] && RUNS_DIR="$CLI_RUNS_DIR"
+  [[ -n "$CLI_LOGS_DIR" ]] && LOGS_DIR="$CLI_LOGS_DIR"
+  [[ -n "$CLI_OWW_REPO_DIR" ]] && OWW_REPO_DIR="$CLI_OWW_REPO_DIR"
+  [[ -n "$CLI_CUSTOM_MODELS_DIR" ]] && CUSTOM_MODELS_DIR="$CLI_CUSTOM_MODELS_DIR"
+  [[ -n "$CLI_DATA_DIR" ]] && DATA_DIR="$CLI_DATA_DIR"
+  [[ -n "$CLI_MIN_FREE_DISK_GB" ]] && MIN_FREE_DISK_GB="$CLI_MIN_FREE_DISK_GB"
+  [[ "$CLI_ALLOW_LOW_DISK" -eq 1 ]] && ALLOW_LOW_DISK=1
+  [[ -n "$CLI_WAKE_PHRASE" ]] && WAKE_PHRASE="$CLI_WAKE_PHRASE"
+  [[ -n "$CLI_TRAIN_PROFILE" ]] && TRAIN_PROFILE="$CLI_TRAIN_PROFILE"
+  [[ -n "$CLI_TRAIN_THREADS" ]] && TRAIN_THREADS="$CLI_TRAIN_THREADS"
+  [[ -n "$CLI_MODEL_FORMAT" ]] && MODEL_FORMAT="$CLI_MODEL_FORMAT"
+  [[ -n "$CLI_WYOMING_PIPER_HOST" ]] && WYOMING_PIPER_HOST="$CLI_WYOMING_PIPER_HOST"
+  [[ -n "$CLI_WYOMING_PIPER_PORT" ]] && WYOMING_PIPER_PORT="$CLI_WYOMING_PIPER_PORT"
+  [[ -n "$CLI_WYOMING_OWW_HOST" ]] && WYOMING_OPENWAKEWORD_HOST="$CLI_WYOMING_OWW_HOST"
+  [[ -n "$CLI_WYOMING_OWW_PORT" ]] && WYOMING_OPENWAKEWORD_PORT="$CLI_WYOMING_OWW_PORT"
+  [[ "$CLI_NON_INTERACTIVE" -eq 1 ]] && NON_INTERACTIVE=1
 
-  umask "${UMASK:-022}"
+  if [[ "$CLI_NO_TMUX" -ne 1 ]]; then
+    log "NOTE: tmux mode is no longer used in Docker-first workflow; running inline."
+  fi
 
   require_cmd bash
   require_cmd python3
+  require_cmd tee
+  require_cmd find
+  require_cmd cp
+  require_cmd df
 
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-  local host_piper="${WYOMING_PIPER_HOST:-127.0.0.1}"
-  local port_piper="${WYOMING_PIPER_PORT:-10200}"   # common wyoming-piper port :contentReference[oaicite:3]{index=3}
-  local host_oww="${WYOMING_OPENWAKEWORD_HOST:-127.0.0.1}"
-  local port_oww="${WYOMING_OPENWAKEWORD_PORT:-10400}" # wyoming-openwakeword default :contentReference[oaicite:4]{index=4}
-
-  local have_wyoming_piper=0
-  local have_wyoming_oww=0
-  local have_local_wyoming_piper=0
-  local have_local_wyoming_oww=0
-  if port_open "$host_piper" "$port_piper" 1; then have_wyoming_piper=1; fi
-  if port_open "$host_oww" "$port_oww" 1; then have_wyoming_oww=1; fi
-  if port_open "127.0.0.1" "$port_piper" 1; then have_local_wyoming_piper=1; fi
-  if port_open "127.0.0.1" "$port_oww" 1; then have_local_wyoming_oww=1; fi
-
-  log "Detected: wyoming-piper on ${host_piper}:${port_piper} => ${have_wyoming_piper}"
-  log "Detected: wyoming-openwakeword on ${host_oww}:${port_oww} => ${have_wyoming_oww}"
-  log "Detected: wyoming-piper on localhost:${port_piper} => ${have_local_wyoming_piper}"
-  log "Detected: wyoming-openwakeword on localhost:${port_oww} => ${have_local_wyoming_oww}"
-
-  if is_raspberry_pi; then
-    log "Platform: Raspberry Pi detected."
-  else
-    log "Platform: not positively identified as Raspberry Pi (continuing)."
-  fi
-  log "Arch: $(arch); OS: $(os_id)"
-
-  # Workspace layout
-  local base_dir="${BASE_DIR:-$HOME/wakeword_lab}"
+  local base_dir="${BASE_DIR:-/workspace}"
   base_dir="$(expand_tilde "$base_dir")"
-  local repo_dir="${OWW_REPO_DIR:-$base_dir/openWakeWord}"
-  local venv_dir="${VENV_DIR:-$base_dir/venv}"
+  [[ "$base_dir" != "/" ]] || die "BASE_DIR must not be '/'."
+
   local runs_dir="${RUNS_DIR:-$base_dir/training_runs}"
   local logs_dir="${LOGS_DIR:-$base_dir/logs}"
+  local repo_dir="${OWW_REPO_DIR:-$base_dir/openWakeWord_upstream}"
   local custom_models_dir="${CUSTOM_MODELS_DIR:-$base_dir/custom_models}"
   local data_dir="${DATA_DIR:-$base_dir/data}"
-  repo_dir="$(expand_tilde "$repo_dir")"
-  venv_dir="$(expand_tilde "$venv_dir")"
+
   runs_dir="$(expand_tilde "$runs_dir")"
   logs_dir="$(expand_tilde "$logs_dir")"
+  repo_dir="$(expand_tilde "$repo_dir")"
   custom_models_dir="$(expand_tilde "$custom_models_dir")"
   data_dir="$(expand_tilde "$data_dir")"
 
-  # If the repo path contains a stub openWakeWord checkout, switch to a real clone.
-  local stub_train_py="$repo_dir/openwakeword/train.py"
-  local is_stub=0
-  if [[ -f "$stub_train_py" ]] && grep -Eqi "stub openwakeword|dummy model|simulated" "$stub_train_py" 2>/dev/null; then
-    is_stub=1
-  fi
-
-  if [[ $is_stub -eq 1 ]]; then
-    log "Detected stub openWakeWord checkout at $repo_dir."
-    local upstream_repo_dir="$base_dir/openWakeWord_upstream"
-    repo_dir="$upstream_repo_dir"
-  fi
-
-  validate_base_dir "$base_dir"
   mkdir -p "$base_dir" "$runs_dir" "$logs_dir" "$custom_models_dir" "$data_dir"
-  require_free_disk_gb "$base_dir" "${MIN_FREE_DISK_GB:-8}"
+  require_free_disk_gb "$base_dir" "${MIN_FREE_DISK_GB:-2}"
 
-  local apt_stamp="$logs_dir/.apt_updated"
-  
-  # Check if we're in a Docker container
-  local in_docker=0
-  [[ -f "/.dockerenv" ]] && in_docker=1
-  
-  if [[ $in_docker -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
-    # Core tooling (Debian/Ubuntu/Raspbian) - only if not in Docker
-    local -a req_pkgs=(
-      ca-certificates
-      curl
-      git
-      tmux
-      build-essential
-      pkg-config
-      python3-venv
-      python3-pip
-      python3-dev
-      ffmpeg
-      sox
-      libsndfile1
-      libsndfile1-dev
-      libasound2-dev
-      libffi-dev
-      libssl-dev
-      jq
-    )
-    local -a to_install=()
-    for p in "${req_pkgs[@]}"; do
-      if ! dpkg -s "$p" >/dev/null 2>&1; then to_install+=("$p"); fi
-    done
-    if [[ ${#to_install[@]} -gt 0 ]]; then
-      apt_update_once "$apt_stamp"
-      apt_install_many "${to_install[@]}"
-    fi
-  elif [[ "$(uname)" == "Darwin" ]]; then
-    log "Detected macOS. Using Homebrew for system dependencies."
-    for pkg in ffmpeg sox libsndfile jq tmux git; do
-      if ! command -v "$pkg" >/dev/null 2>&1; then
-        log "Installing $pkg via Homebrew..."
-        brew install "$pkg" || log "WARNING: Homebrew install failed for $pkg."
-      fi
-    done
-    log "macOS system dependencies handled. Using Python packages for all other dependencies."
+  local train_py="$repo_dir/openwakeword/train.py"
+  [[ -f "$train_py" ]] || die "Missing openWakeWord trainer at $train_py. Ensure Docker image includes /workspace/openWakeWord_upstream."
+
+  local dataset_generator="$script_dir/generate_dataset.py"
+  [[ -f "$dataset_generator" ]] || die "Missing dataset generator: $dataset_generator"
+
+  local host_piper="${WYOMING_PIPER_HOST:-127.0.0.1}"
+  local port_piper="${WYOMING_PIPER_PORT:-10200}"
+  local host_oww="${WYOMING_OPENWAKEWORD_HOST:-127.0.0.1}"
+  local port_oww="${WYOMING_OPENWAKEWORD_PORT:-10400}"
+
+  if port_open "$host_piper" "$port_piper" 1; then
+    log "Detected Wyoming piper at ${host_piper}:${port_piper}"
   else
-    log "Non-Debian, non-macOS platform detected. Skipping system package install. Using Python packages for all dependencies."
+    log "WARNING: Wyoming piper not reachable at ${host_piper}:${port_piper}"
   fi
-
-  require_cmd git
-  require_cmd tmux
-  require_cmd python3
-
-  # Clone or update openWakeWord repo
-  if [[ -d "$repo_dir/.git" ]]; then
-    log "openWakeWord repo already present: $repo_dir"
-    if have_internet_dns; then
-      log "Attempting fast-forward update (git pull --ff-only)..."
-      (cd "$repo_dir" && git pull --ff-only) || log "WARNING: git pull failed (continuing with existing checkout)."
-    else
-      log "No DNS resolution detected; skipping repo update."
-    fi
-  elif [[ -d "$repo_dir/openwakeword" ]]; then
-    log "Local openWakeWord source found at $repo_dir; skipping git clone."
+  if port_open "$host_oww" "$port_oww" 1; then
+    log "Detected Wyoming openwakeword at ${host_oww}:${port_oww}"
   else
-    have_internet_dns || die "No DNS resolution detected; cannot clone repos. Fix networking or pre-clone openWakeWord into $repo_dir."
-    log "Cloning openWakeWord into $repo_dir ..."
-    git clone --depth 1 https://github.com/dscripka/openWakeWord.git "$repo_dir" \
-      || die "git clone failed."
+    log "WARNING: Wyoming openwakeword not reachable at ${host_oww}:${port_oww}"
   fi
 
-  # Ensure venv exists and activate it (preferred: reuse existing venv to avoid permission issues)
-  if [[ -f "$venv_dir/bin/activate" ]]; then
-    log "Using existing venv: $venv_dir"
-  else
-    log "Creating venv: $venv_dir"
-    venv_attempts=0
-    until python3 -m venv "$venv_dir"; do
-      venv_attempts=$((venv_attempts+1))
-      log "venv creation failed, retrying ($venv_attempts)..."
-      sleep 2
-      if [[ $venv_attempts -ge 3 ]]; then
-        die "venv creation failed after 3 attempts."
-      fi
-    done
-  fi
-  # shellcheck disable=SC1091
-  source "$venv_dir/bin/activate"
-
-  # Upgrade pip/setuptools/wheel with retries
-  pip_attempts=0
-  until PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 \
-    python -m pip install -U --no-input --disable-pip-version-check pip setuptools wheel; do
-    pip_attempts=$((pip_attempts+1))
-    log "pip bootstrap/upgrade failed, retrying ($pip_attempts)..."
-    sleep 2
-    if [[ $pip_attempts -ge 3 ]]; then
-      die "pip bootstrap/upgrade failed after 3 attempts."
-    fi
-  done
-
-  # Install baseline Python deps (best-effort superset for training flows)
-  log "Installing Python packages (best-effort superset for openWakeWord training + Piper dataset gen)..."
-  install_tflite_runtime_if_available || log "WARNING: tflite-runtime setup failed; continuing without it."
-  local -a pip_pkgs=(
-    setuptools
-    pyyaml
-    numpy
-    scipy
-    soundfile
-    resampy
-    tqdm
-    matplotlib
-    scikit-learn
-    onnx
-    onnxruntime
-    datasets
-    speechbrain
-    torchinfo
-    torchmetrics
-    pronouncing
-    mutagen
-    acoustics
-    audiomentations
-    torch-audiomentations
-  )
-  if [[ "$have_wyoming_piper" -eq 1 || "$have_local_wyoming_piper" -eq 1 ]]; then
-    log "Wyoming piper detected; skipping piper-tts install."
-  else
-    pip_pkgs+=(piper-tts)
-  fi
-  pip_pkgs_install_attempts=0
-  until pip_install "${pip_pkgs[@]}"; do
-    pip_pkgs_install_attempts=$((pip_pkgs_install_attempts+1))
-    log "pip install of training packages failed, retrying ($pip_pkgs_install_attempts)..."
-    sleep 2
-    if [[ $pip_pkgs_install_attempts -ge 3 ]]; then
-      die "pip install of training packages failed after 3 attempts."
-    fi
-  done
-
-  # Try to ensure torch exists (training often needs it; if your distro provided python3-torch, this may already pass)
-  if ! python_import_check torch >/dev/null 2>&1; then
-    log "torch not importable yet; attempting pip install torch + torchaudio (may fail on some Pi OS/arches)."
-    if ! (pip_install torch torchaudio); then
-      log "WARNING: torch install failed. If training requires torch, you must resolve torch installation for your Pi (64-bit strongly recommended)."
-    fi
-  fi
-
-  # Install openWakeWord from the repo (editable)
-  local skip_openwakeword_install=0
-  if [[ "$have_wyoming_oww" -eq 1 || "$have_local_wyoming_oww" -eq 1 ]] \
-    && python_import_check openwakeword >/dev/null 2>&1; then
-    skip_openwakeword_install=1
-    log "Wyoming openwakeword detected and openwakeword importable; skipping editable install."
-  fi
-  # If a local checkout of openWakeWord exists in the repo dir, prefer it (offline-friendly)
-  if [[ -d "$repo_dir/openwakeword" ]]; then
-    skip_openwakeword_install=1
-    export PYTHONPATH="$repo_dir:${PYTHONPATH:-}"
-    log "Found local openwakeword package in $repo_dir; skipping pip editable install and using local source."
-  fi
-
-  if [[ "$skip_openwakeword_install" -eq 0 ]]; then
-    log "Installing openWakeWord from local repo (editable)..."
-    if ! python -m pip install -e "$repo_dir" ; then
-      log "WARNING: Editable install failed. Retrying without dependency resolution (pip --no-deps)."
-      if ! python -m pip install -e "$repo_dir" --no-deps ; then
-        die "Failed to install openWakeWord from $repo_dir"
-      fi
-    fi
-    python_import_check openwakeword >/dev/null 2>&1 || die "openwakeword import check failed after install."
-  fi
-
-  # User inputs
   local wake_phrase="${WAKE_PHRASE:-}"
   prompt_nonempty wake_phrase "Wake phrase to train" "hey assistant"
-  local model_slug
-  model_slug="$(slugify "$wake_phrase")"
-  [[ -n "$model_slug" ]] || die "Derived model slug is empty (unexpected)."
 
   local train_profile="${TRAIN_PROFILE:-}"
-  prompt_choice train_profile "Training profile" "medium" "tiny" "medium" "large"
+  prompt_choice train_profile "Training profile" "medium" tiny medium large
 
-  local train_threads="${TRAIN_THREADS:-}"
   local default_threads
-  default_threads="$(python - <<'PY'
+  default_threads="$(python3 - <<'PY'
 import os
-try:
-  import multiprocessing as mp
-  print(max(1, mp.cpu_count()))
-except Exception:
-  print(1)
+print(max(1, os.cpu_count() or 1))
 PY
 )"
+  local train_threads="${TRAIN_THREADS:-}"
   prompt_nonempty train_threads "CPU threads to use" "$default_threads"
   [[ "$train_threads" =~ ^[0-9]+$ ]] || die "TRAIN_THREADS must be an integer."
 
   local model_format="${MODEL_FORMAT:-}"
-  prompt_choice model_format "Model format" "both" "tflite" "onnx" "both"
+  prompt_choice model_format "Model format" "tflite" tflite onnx both
+
+  local model_slug
+  model_slug="$(slugify "$wake_phrase")"
+  [[ -n "$model_slug" ]] || die "Derived model slug is empty."
 
   local run_id
   run_id="$(date -u +%Y%m%dT%H%M%SZ)"
   local run_dir="$runs_dir/${model_slug}_${run_id}"
   local dataset_dir="$run_dir/dataset"
   local dataset_json="$dataset_dir/dataset.json"
-  mkdir -p "$run_dir"
+  mkdir -p "$run_dir" "$dataset_dir"
 
-  # Choose epochs as a simple mapping (best-effort; will only apply if YAML has an epoch key we recognize)
   local epochs=25
   case "$train_profile" in
-    tiny)   epochs=10 ;;
+    tiny) epochs=10 ;;
     medium) epochs=25 ;;
-    large)  epochs=50 ;;
+    large) epochs=50 ;;
   esac
 
-  # Prepare training config
-  local example_cfg="$repo_dir/examples/custom_model.yml"
-  [[ -f "$example_cfg" ]] || die "Expected example config not found: $example_cfg"
-  local cfg_in="$example_cfg"
+  local cfg_in="$repo_dir/examples/custom_model.yml"
   local cfg_out="$run_dir/training_config.yml"
+  [[ -f "$cfg_in" ]] || die "Expected training template missing: $cfg_in"
   cp -f "$cfg_in" "$cfg_out"
 
-  # Patch YAML (best-effort; only touches known key names if present)
-  log "Patching training config (best-effort) -> $cfg_out"
-  RUN_DIR="$run_dir" DATASET_JSON="$dataset_json" python - <<PY
-import os, sys
+  RUN_DIR="$run_dir" DATASET_JSON="$dataset_json" WAKE_PHRASE="$wake_phrase" MODEL_SLUG="$model_slug" EPOCHS="$epochs" python3 - <<'PY'
+import os
 import yaml
 
-cfg_path = "${cfg_out}"
-wake_phrase = "${wake_phrase}"
-model_slug = "${model_slug}"
-epochs = int("${epochs}")
-run_dir = os.environ.get("RUN_DIR", "")
-dataset_json = os.environ.get("DATASET_JSON", "")
+cfg_path = os.environ["RUN_DIR"] + "/training_config.yml"
+wake_phrase = os.environ["WAKE_PHRASE"]
+model_slug = os.environ["MODEL_SLUG"]
+epochs = int(os.environ["EPOCHS"])
+run_dir = os.environ["RUN_DIR"]
+dataset_json = os.environ["DATASET_JSON"]
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
@@ -929,7 +493,6 @@ def set_key_recursive(obj, key, value):
         for it in obj:
             set_key_recursive(it, key, value)
 
-# Common keys observed in openWakeWord training flows (best-effort)
 for k in ("target_phrase", "target_phrases", "wake_phrase", "wake_phrases"):
     set_key_recursive(cfg, k, [wake_phrase] if k.endswith("s") or k.startswith("target_") else wake_phrase)
 
@@ -937,12 +500,10 @@ for k in ("model_name", "wakeword_name", "wake_word_name"):
     set_key_recursive(cfg, k, model_slug)
 
 for k in ("output_dir", "model_output_dir", "export_dir"):
-    if run_dir:
-        set_key_recursive(cfg, k, run_dir)
+    set_key_recursive(cfg, k, run_dir)
 
 for k in ("dataset_path", "dataset_json", "custom_dataset_path", "custom_dataset"):
-    if dataset_json:
-        set_key_recursive(cfg, k, dataset_json)
+    set_key_recursive(cfg, k, dataset_json)
 
 for k in ("epochs", "n_epochs", "num_epochs", "max_epochs"):
     set_key_recursive(cfg, k, epochs)
@@ -953,157 +514,88 @@ with open(cfg_path, "w", encoding="utf-8") as f:
 print("Updated YAML keys:", sorted(set(updated)))
 PY
 
-  # Create a deterministic training script that tmux will run
-  local train_sh="$run_dir/run_training.sh"
-  cat >"$train_sh" <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-IFS=\$'\\n\\t'
+  local positive_sources="${POSITIVE_SOURCES:-$data_dir/positives}"
+  local negative_sources="${NEGATIVE_SOURCES:-$data_dir/negatives}"
+  local max_positive="${MAX_POSITIVE_SAMPLES:-250}"
+  local max_negative="${MAX_NEGATIVE_SAMPLES:-1000}"
+  local min_per_source="${MIN_PER_SOURCE:-3}"
+  local dataset_seed="${DATASET_SEED:-42}"
 
-log() { echo "[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] [train] \$*" >&2; }
-die() { echo "[\$(date -u +%Y-%m-%dT%H:%M:%SZ)] [train] FATAL: \$*" >&2; exit 1; }
-trap 'die "Unhandled error at line \$LINENO."' ERR
+  log "Generating dataset manifest from positives='${positive_sources}' negatives='${negative_sources}'"
+  python3 "$dataset_generator" \
+    --output-dir "$dataset_dir" \
+    --wake-phrase "$wake_phrase" \
+    --positive-sources "$positive_sources" \
+    --negative-sources "$negative_sources" \
+    --max-positives "$max_positive" \
+    --max-negatives "$max_negative" \
+    --min-per-source "$min_per_source" \
+    --seed "$dataset_seed"
 
-VENV_DIR="${venv_dir}"
-REPO_DIR="${repo_dir}"
-export RUN_DIR="${run_dir}"
-export CFG_PATH="${cfg_out}"
-export CUSTOM_MODELS_DIR="${custom_models_dir}"
-export TRAIN_THREADS="${train_threads}"
-export MODEL_FORMAT="${model_format}"
-export DATA_DIR="${data_dir}"
-export DATASET_DIR="${dataset_dir}"
-export DATASET_JSON="${dataset_json}"
-GENERATE_DATASET="${script_dir}/generate_dataset.py"
-POSITIVE_SOURCES="${POSITIVE_SOURCES:-}"
-NEGATIVE_SOURCES="${NEGATIVE_SOURCES:-}"
-MAX_POSITIVE_SAMPLES="${MAX_POSITIVE_SAMPLES:-}"
-MAX_NEGATIVE_SAMPLES="${MAX_NEGATIVE_SAMPLES:-}"
-MIN_PER_SOURCE="${MIN_PER_SOURCE:-}"
-DATASET_SEED="${DATASET_SEED:-42}"
+  mapfile -t dataset_counts < <(python3 - <<PY
+import json
+with open("$dataset_json", "r", encoding="utf-8") as f:
+    d = json.load(f)
+s = d.get("summary", {})
+print(int(s.get("selected_positives", 0)))
+print(int(s.get("selected_negatives", 0)))
+PY
+)
+  local selected_pos="${dataset_counts[0]:-0}"
+  local selected_neg="${dataset_counts[1]:-0}"
 
-[[ -f "\$VENV_DIR/bin/activate" ]] || die "Missing venv activate script: \$VENV_DIR/bin/activate"
-# shellcheck disable=SC1091
-source "\$VENV_DIR/bin/activate"
+  (( selected_pos > 0 )) || die "Dataset manifest has zero positive samples."
+  (( selected_neg > 0 )) || die "Dataset manifest has zero negative samples."
 
-python -c "import openwakeword" >/dev/null 2>&1 || die "openwakeword not importable inside venv."
+  export OMP_NUM_THREADS="$train_threads"
+  export OPENBLAS_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
 
-export OMP_NUM_THREADS="\$TRAIN_THREADS"
-export OPENBLAS_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
+  local log_file="$run_dir/training.log"
+  touch "$run_dir/.start_time"
 
-mkdir -p "\$RUN_DIR" "\$CUSTOM_MODELS_DIR"
-cd "\$REPO_DIR" || die "Cannot cd to repo dir: \$REPO_DIR"
+  log "Training start"
+  log "Wake phrase: $wake_phrase"
+  log "Run dir: $run_dir"
+  log "Config: $cfg_out"
+  log "Threads: $train_threads"
 
-touch "\$RUN_DIR/.start_time"
+  (
+    cd "$repo_dir"
+    python3 openwakeword/train.py --training_config "$cfg_out" --generate_clips
+    python3 openwakeword/train.py --training_config "$cfg_out" --augment_clips
+    python3 openwakeword/train.py --training_config "$cfg_out" --train_model
+  ) 2>&1 | tee -a "$log_file"
 
-log "Training start"
-log "Config: \$CFG_PATH"
-log "Run dir: \$RUN_DIR"
-log "Threads: \$TRAIN_THREADS"
+  mapfile -t tflites < <(find "$run_dir" "$repo_dir" -type f -name "*.tflite" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+  mapfile -t onnxes  < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx"  -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
 
-# Ensure a diverse dataset manifest before training.
-if [[ -f "\$GENERATE_DATASET" ]]; then
-  log "Generating diversified dataset manifest..."
-  python "\$GENERATE_DATASET" \\
-    --output-dir "\$DATASET_DIR" \\
-    --wake-phrase "${wake_phrase}" \\
-    --positive-sources "\${POSITIVE_SOURCES:-\$DATA_DIR/positives}" \\
-    --negative-sources "\${NEGATIVE_SOURCES:-\$DATA_DIR/negatives}" \\
-    --max-positives "\${MAX_POSITIVE_SAMPLES}" \\
-    --max-negatives "\${MAX_NEGATIVE_SAMPLES}" \\
-    --min-per-source "\${MIN_PER_SOURCE}" \\
-    --seed "\${DATASET_SEED}"
-else
-  log "WARNING: generate_dataset.py not found at \$GENERATE_DATASET; skipping dataset manifest generation."
-fi
+  case "$model_format" in
+    tflite) onnxes=() ;;
+    onnx) tflites=() ;;
+    both) ;;
+  esac
 
-# openWakeWord training script is driven by a YAML config and supports step flags in typical flows. :contentReference[oaicite:5]{index=5}
-# NOTE: If upstream flags change, this will fail loudly and you must adjust the command.
-python openwakeword/train.py --training_config "\$CFG_PATH" --generate_clips 2>&1 | tee -a "\$RUN_DIR/training.log"
-python openwakeword/train.py --training_config "\$CFG_PATH" --augment_clips 2>&1 | tee -a "\$RUN_DIR/training.log"
-python openwakeword/train.py --training_config "\$CFG_PATH" --train_model 2>&1 | tee -a "\$RUN_DIR/training.log"
-
-log "Training finished; searching for newly produced model artifacts..."
-mapfile -t tflites < <(find "\$RUN_DIR" "\$REPO_DIR" -type f -name "*.tflite" -newer "\$RUN_DIR/.start_time" 2>/dev/null | sort || true)
-mapfile -t onnxes  < <(find "\$RUN_DIR" "\$REPO_DIR" -type f -name "*.onnx"  -newer "\$RUN_DIR/.start_time" 2>/dev/null | sort || true)
-
-case "\${MODEL_FORMAT:-both}" in
-  tflite)
-    onnxes=()
-    ;;
-  onnx)
-    tflites=()
-    ;;
-  both)
-    ;;
-  *)
-    log "WARNING: Unknown MODEL_FORMAT='\${MODEL_FORMAT}'. Copying all formats."
-    ;;
-esac
-
-if [[ \${#tflites[@]} -eq 0 && \${#onnxes[@]} -eq 0 ]]; then
-  log "WARNING: No new .tflite/.onnx files found. Check \$RUN_DIR/training.log for where outputs were written."
-else
-  if [[ \${#tflites[@]} -gt 0 ]]; then
-    for f in "\${tflites[@]}"; do
-      log "Copying: \$f -> \$CUSTOM_MODELS_DIR/"
-      cp -f "\$f" "\$CUSTOM_MODELS_DIR/" || die "Failed to copy \$f"
-    done
+  if [[ ${#tflites[@]} -eq 0 && ${#onnxes[@]} -eq 0 ]]; then
+    die "No trained model artifacts (.tflite/.onnx) were found. Check $log_file"
   fi
-  if [[ \${#onnxes[@]} -gt 0 ]]; then
-    for f in "\${onnxes[@]}"; do
-      log "Copying: \$f -> \$CUSTOM_MODELS_DIR/"
-      cp -f "\$f" "\$CUSTOM_MODELS_DIR/" || die "Failed to copy \$f"
-    done
-  fi
-fi
 
-log "Artifacts directory: \$CUSTOM_MODELS_DIR"
-log "Done."
-EOF
-  chmod +x "$train_sh"
-
-  # Start tmux session or run directly
-  local session="wakeword_${model_slug}_${run_id}"
-  
-  if [[ "$NO_TMUX" -eq 1 ]]; then
-    log "Running training directly (--no-tmux mode)..."
-    bash "$train_sh"
-  else
-    if tmux has-session -t "$session" >/dev/null 2>&1; then
-      die "tmux session already exists: $session"
-    fi
-
-    log "Launching training in tmux session: $session"
-    tmux new-session -d -s "$session" "bash -lc '$train_sh'"
-
-    # Post-flight info (tell it like it is)
-    log "tmux session started."
-  fi
+  for f in "${tflites[@]}" "${onnxes[@]}"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    cp -f "$f" "$custom_models_dir/"
+    log "Copied artifact: $f -> $custom_models_dir/"
+  done
 
   echo
-  echo "=== STARTED ==="
+  echo "=== COMPLETE ==="
   echo "Wake phrase      : $wake_phrase"
   echo "Model slug       : $model_slug"
   echo "Run dir          : $run_dir"
-  echo "Log file         : $run_dir/training.log"
-  echo "Custom models dir: $custom_models_dir"
-  echo
-  if [[ "$NO_TMUX" -ne 1 ]]; then
-    echo "Attach to training:"
-    echo "  tmux attach -t $session"
-    echo
-  fi
-  echo "If you already run Wyoming services:"
-  echo "  wyoming-openwakeword detected on ${host_oww}:${port_oww} => ${have_wyoming_oww}"
-  echo "  wyoming-piper        detected on ${host_piper}:${port_piper} => ${have_wyoming_piper}"
-  echo "  localhost openwakeword detected on ${port_oww} => ${have_local_wyoming_oww}"
-  echo "  localhost piper       detected on ${port_piper} => ${have_local_wyoming_piper}"
-  echo
-  echo "To serve a trained .tflite via Wyoming openWakeWord, the server commonly listens on 10400 and supports --custom-model-dir. :contentReference[oaicite:6]{index=6}"
-  echo "=== END ==="
+  echo "Training log     : $log_file"
+  echo "Artifacts dir    : $custom_models_dir"
+  echo "Model format     : $model_format"
+  echo "================"
 }
 
 main "$@"
