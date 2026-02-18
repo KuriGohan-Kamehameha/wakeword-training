@@ -9,6 +9,8 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     git \
     ffmpeg \
     sox \
+    espeak-ng \
+    libespeak-ng1 \
     libsndfile1 \
     libsndfile1-dev \
     libasound2-dev \
@@ -30,7 +32,7 @@ RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel && \
     pip install --no-cache-dir \
     pyyaml \
     numpy \
-    scipy \
+    "scipy<1.17" \
     soundfile \
     resampy \
     tqdm \
@@ -43,6 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel && \
     speechbrain \
     torch==2.8.0 \
     torchaudio==2.8.0 \
+    espeak-phonemizer \
     piper-tts \
     flask \
     torchinfo \
@@ -51,6 +54,7 @@ RUN pip install --no-cache-dir --upgrade pip "setuptools<81" wheel && \
     mutagen \
     acoustics \
     audiomentations \
+    webrtcvad \
     torch-audiomentations
 
 # Clone openWakeWord repository
@@ -65,7 +69,7 @@ COPY . .
 RUN chmod +x trainer.sh docker-train.sh generate_dataset.py generate_training_samples.py 2>/dev/null || true
 
 # Set environment variables
-ENV PYTHONPATH=/workspace/openWakeWord_upstream:${PYTHONPATH}
+ENV PYTHONPATH=/workspace/openWakeWord_upstream
 ENV BASE_DIR=/workspace
 ENV OWW_REPO_DIR=/workspace/openWakeWord_upstream
 ENV PATH=/usr/local/bin:${PATH}
