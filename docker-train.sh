@@ -16,6 +16,7 @@ MODEL_FORMAT="${MODEL_FORMAT:-tflite}"
 DEVICE_ID="${DEVICE_ID:-}"
 DEVICE_LABEL=""
 GENERATE_SAMPLES="${GENERATE_SAMPLES:-0}"
+EMIT_PIRANESI_ENTRY="${EMIT_PIRANESI_ENTRY:-0}"
 NUM_POSITIVES="${NUM_POSITIVES:-100}"
 NUM_NEGATIVES="${NUM_NEGATIVES:-100}"
 
@@ -42,6 +43,8 @@ Options:
   --device ID             Device workflow ID from device_workflows.json
   --list-devices          Print available device IDs and exit
   --generate-samples      Auto-generate positive/negative training samples
+  --emit-piranesi-entry   Also emit a <slug>.phrases-entry.json sidecar
+                          shaped for Piranesi's vector-override receiver
   --positives NUMBER      Positive samples to generate (default: 100)
   --negatives NUMBER      Negative samples to generate (default: 100)
   --build                 Rebuild Docker images before training
@@ -346,6 +349,10 @@ while [[ $# -gt 0 ]]; do
       GENERATE_SAMPLES=1
       shift
       ;;
+    --emit-piranesi-entry)
+      EMIT_PIRANESI_ENTRY=1
+      shift
+      ;;
     --positives)
       NUM_POSITIVES="$2"
       shift 2
@@ -484,12 +491,16 @@ CMD=(
   --train-threads "$TRAIN_THREADS"
   --model-format "$MODEL_FORMAT"
 )
+if [[ "$EMIT_PIRANESI_ENTRY" -eq 1 ]]; then
+  CMD+=( --emit-piranesi-entry )
+fi
 
 docker compose run --rm \
   -e WYOMING_PIPER_HOST=piper \
   -e WYOMING_PIPER_PORT=10200 \
   -e WYOMING_OPENWAKEWORD_HOST=openwakeword \
   -e WYOMING_OPENWAKEWORD_PORT=10400 \
+  -e DEVICE_ID="$DEVICE_ID" \
   trainer "${CMD[@]}"
 
 EXIT_CODE=$?

@@ -85,6 +85,11 @@
       "profile": "tiny",
       "max_filesize_kb": 100,
       "threads": 2,
+      "eval_gate": {
+        "max_far_per_hour": 0.10,
+        "min_recall": 0.50,
+        "_comment": "Permissive opening per Piranesi 2026-04-27. Baseline first; tighten after the first real-world Vector run reveals the SNR floor."
+      },
       "notes": "Wire-pod supports custom wake words via openWakeWord. Provide the .tflite in your wire-pod custom model directory."
     },
     {

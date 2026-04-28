@@ -34,6 +34,9 @@ Options:
   --wyoming-oww-port PORT    Optional connectivity probe target.
   --non-interactive          Skip prompts and use defaults.
   --no-tmux                  Accepted for compatibility (ignored).
+  --emit-piranesi-entry      Emit a <slug>.phrases-entry.json sidecar
+                             shaped for Piranesi's vector-override
+                             receiver (state/wakeword/phrases.json).
   --help, -h                 Show this help.
 
 Environment overrides:
@@ -48,7 +51,39 @@ USAGE
 
 timestamp_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] $*" >&2; }
-die() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $*" >&2; exit 1; }
+
+# Structured exit codes for machine-consumable failure parsing.
+# 0 = success
+# 1 = generic / inherited fatal (legacy die() callers)
+# 2 = eval gate failed (FPR / recall thresholds in device_workflows.json)
+# 3 = dataset insufficient (zero positives or negatives)
+# 4 = docker / environment failure
+# 5 = config error (bad flags, missing device profile, etc.)
+#
+# The last line on stderr for any non-zero exit is a JSON blob
+# {"exit_code","reason","details"} so downstream tools (CI, deploy
+# automation, vector-override install scripts) can parse without
+# scraping free-text logs.
+emit_structured_exit() {
+  local rc="$1" reason="$2" details="${3:-}"
+  python3 -c 'import json, sys; print(json.dumps({"exit_code": int(sys.argv[1]), "reason": sys.argv[2], "details": sys.argv[3]}))' \
+    "$rc" "$reason" "$details" >&2 || true
+}
+
+die() {
+  echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $*" >&2
+  emit_structured_exit 1 "fatal" "$*"
+  exit 1
+}
+
+# die_with_code <message> <exit_code> <reason>
+# Use for new exit paths with semantic exit codes (2..5).
+die_with_code() {
+  local msg="$1" rc="${2:-1}" reason="${3:-fatal}"
+  echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $msg" >&2
+  emit_structured_exit "$rc" "$reason" "$msg"
+  exit "$rc"
+}
 
 on_err() {
   local exit_code=$?
@@ -244,6 +279,7 @@ CLI_DATA_DIR=""
 CLI_MIN_FREE_DISK_GB=""
 CLI_ALLOW_LOW_DISK=0
 CLI_WAKE_PHRASE=""
+CLI_EMIT_PIRANESI_ENTRY=0
 CLI_TRAIN_PROFILE=""
 CLI_TRAIN_THREADS=""
 CLI_MODEL_FORMAT=""
@@ -406,6 +442,10 @@ parse_args() {
         ;;
       --no-tmux)
         CLI_NO_TMUX=1
+        shift
+        ;;
+      --emit-piranesi-entry)
+        CLI_EMIT_PIRANESI_ENTRY=1
         shift
         ;;
       --)
@@ -756,8 +796,8 @@ PY
   local selected_pos="${dataset_counts[0]:-0}"
   local selected_neg="${dataset_counts[1]:-0}"
 
-  (( selected_pos > 0 )) || die "Dataset manifest has zero positive samples."
-  (( selected_neg > 0 )) || die "Dataset manifest has zero negative samples."
+  (( selected_pos > 0 )) || die_with_code "Dataset manifest has zero positive samples." 3 "dataset_insufficient"
+  (( selected_neg > 0 )) || die_with_code "Dataset manifest has zero negative samples." 3 "dataset_insufficient"
 
   export OMP_NUM_THREADS="$train_threads"
   export OPENBLAS_NUM_THREADS=1
@@ -956,12 +996,122 @@ PY
     eval_model="${onnxes[0]}"
   fi
 
+  # Sidecar manifest — every model artifact gets a <slug>.tflite.json (or
+  # <slug>.onnx.json) next to it with training params, voices used, repo
+  # SHA, openWakeWord version, device target. Universal substrate for
+  # every downstream integration (Piranesi-shaped emit, --deploy-to,
+  # future wakeword-install skill). One source of truth per model.
+  local manifest_repo_sha="unknown"
+  if command -v git >/dev/null 2>&1 && [[ -d "$script_dir/.git" || -f "$script_dir/.git" ]]; then
+    manifest_repo_sha="$(git -C "$script_dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  fi
+  local manifest_oww_version="unknown"
+  manifest_oww_version="$(python3 -c 'import openwakeword; print(getattr(openwakeword, "__version__", "unknown"))' 2>/dev/null || echo unknown)"
+  local manifest_built_at; manifest_built_at="$(timestamp_utc)"
+  local manifest_voices_csv="${PIPER_VOICES_USED:-}"
+
+  for f in "${tflites[@]}" "${onnxes[@]}"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    local artifact_name; artifact_name="$(basename -- "$f")"
+    local artifact_dest="$custom_models_dir/$artifact_name"
+    local manifest_path="${artifact_dest}.json"
+    python3 - "$manifest_path" "$artifact_name" "$wake_phrase" "$model_slug" \
+                "$num_positives" "$num_negatives" "$train_profile" "$train_threads" \
+                "$manifest_built_at" "$manifest_repo_sha" "$manifest_oww_version" \
+                "${DEVICE_ID:-}" "$manifest_voices_csv" <<'PY' || die_with_code "manifest emit failed for $artifact_name" 4 "manifest_io"
+import json, sys, os
+(path, artifact, phrase, slug, n_pos, n_neg, profile, threads,
+ built_at, repo_sha, oww_ver, device_id, voices_csv) = sys.argv[1:14]
+voices = [v.strip() for v in voices_csv.split(",") if v.strip()] if voices_csv else []
+manifest = {
+    "schema": "wakeword-training/manifest@v1",
+    "phrase": phrase,
+    "slug": slug,
+    "artifact": artifact,
+    "device_target": device_id or None,
+    "training_params": {
+        "positives": int(n_pos) if str(n_pos).isdigit() else None,
+        "negatives": int(n_neg) if str(n_neg).isdigit() else None,
+        "profile": profile,
+        "threads": int(threads) if str(threads).isdigit() else None,
+    },
+    "piper_voices_used": voices,
+    "built_at": built_at,
+    "repo_sha": repo_sha,
+    "openwakeword_version": oww_ver,
+    "threshold_suggestion": None,
+    "eval_report": None,
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(manifest, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, path)
+print(f"manifest: {path}", file=sys.stderr)
+PY
+    log "Manifest emitted: $manifest_path"
+
+    # Piranesi-shaped emit (--emit-piranesi-entry): write a sibling
+    # <artifact>.phrases-entry.json with exactly the per-phrase object
+    # shape vector-override's state/wakeword/phrases.json expects. User
+    # pastes one block — closes the integration fault line.
+    # Threshold sourced from the manifest's threshold_suggestion when the
+    # eval gate (ship #3) populates it; falls back to 0.5 when eval did
+    # not run or did not produce a recommendation. enabled defaults to
+    # false — Sat flips per-phrase after dropping the model on Piranesi.
+    if [[ "${CLI_EMIT_PIRANESI_ENTRY:-0}" -eq 1 ]]; then
+      local phrases_entry_path="${artifact_dest}.phrases-entry.json"
+      python3 - "$phrases_entry_path" "$manifest_path" "$wake_phrase" "$model_slug" \
+                "$artifact_name" "$manifest_built_at" <<'PY' || die_with_code "phrases-entry emit failed for $artifact_name" 4 "phrases_entry_io"
+import json, sys, os
+(out_path, manifest_path, phrase, slug, artifact, built_at) = sys.argv[1:7]
+threshold = 0.5
+try:
+    with open(manifest_path) as fh:
+        m = json.load(fh)
+    sug = m.get("threshold_suggestion")
+    if isinstance(sug, (int, float)) and 0.0 < sug < 1.0:
+        threshold = float(sug)
+except Exception:
+    pass
+entry = {
+    "schema": "vector-override/phrases-entry@v1",
+    "slug": slug,
+    "phrase": phrase,
+    "model": artifact,
+    "trained_at": built_at,
+    "threshold": threshold,
+    "route": {
+        "action": "takeover",
+        "default_esn": None,
+        "speak_template": None,
+    },
+    "enabled": False,
+}
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+tmp = out_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(entry, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, out_path)
+print(f"phrases-entry: {out_path}", file=sys.stderr)
+PY
+      log "Piranesi phrases-entry emitted: $phrases_entry_path"
+    fi
+  done
+
   local closed_loop_eval="$script_dir/closed_loop_eval.py"
+  local eval_report=""
+  local eval_ran=0
+  local eval_recall=""
+  local eval_far_per_hour=""
+  local eval_threshold=""
   if [[ -n "$eval_model" && -f "$closed_loop_eval" ]]; then
     local feature_dir="$run_dir/$model_slug"
     local eval_pos_dir="$feature_dir/positive_test"
     local eval_neg_dir="$feature_dir/negative_test"
-    local eval_report="$run_dir/evaluation/closed_loop_report.json"
+    eval_report="$run_dir/evaluation/closed_loop_report.json"
     local hard_neg_dir="$data_dir/hard_negatives/$model_slug"
     local target_far_per_hour="${TARGET_FALSE_ALARMS_PER_HOUR:-0.1}"
     local closed_loop_max_clips="${CLOSED_LOOP_MAX_CLIPS:-600}"
@@ -969,6 +1119,9 @@ PY
     mkdir -p "$(dirname "$eval_report")" "$hard_neg_dir"
     if [[ -d "$eval_pos_dir" && -d "$eval_neg_dir" ]]; then
       log "Running closed-loop evaluation + hard-negative mining"
+      # Eval is no longer a soft-fail. A trainer that produces a model
+      # which can't be evaluated is producing a model nobody can trust;
+      # propagate the failure so CI / deploy automation see it.
       python3 "$closed_loop_eval" \
         --model-path "$eval_model" \
         --positives-dir "$eval_pos_dir" \
@@ -977,10 +1130,145 @@ PY
         --max-clips "$closed_loop_max_clips" \
         --hard-negatives-dir "$hard_neg_dir" \
         --max-mined "$max_mined_hard_negatives" \
-        --report-path "$eval_report" \
-        || log "WARNING: closed-loop evaluation failed; continuing."
+        --report-path "$eval_report"
+      eval_ran=1
+      # Pull metrics for gate + manifest backfill.
+      mapfile -t _eval_metrics < <(python3 - "$eval_report" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        r = json.load(fh)
+except Exception:
+    print(""); print(""); print("")
+    sys.exit(0)
+print(r.get("positive_recall", ""))
+print(r.get("observed_far_per_hour", ""))
+print(r.get("recommended_threshold", ""))
+PY
+)
+      eval_recall="${_eval_metrics[0]:-}"
+      eval_far_per_hour="${_eval_metrics[1]:-}"
+      eval_threshold="${_eval_metrics[2]:-}"
+      log "Eval: recall=${eval_recall} far_per_hour=${eval_far_per_hour} threshold=${eval_threshold}"
     else
       log "WARNING: Skipping closed-loop eval (missing clip dirs: $eval_pos_dir / $eval_neg_dir)"
+    fi
+  fi
+
+  # Backfill the manifest sidecar with eval results so downstream consumers
+  # (Piranesi-shaped phrases-entry, future --deploy-to) see threshold +
+  # observed metrics in the same JSON they already read.
+  if (( eval_ran == 1 )) && [[ -n "$eval_report" && -f "$eval_report" ]]; then
+    for f in "${tflites[@]}" "${onnxes[@]}"; do
+      [[ -n "$f" && -f "$f" ]] || continue
+      local artifact_name; artifact_name="$(basename -- "$f")"
+      local manifest_path="$custom_models_dir/${artifact_name}.json"
+      [[ -f "$manifest_path" ]] || continue
+      python3 - "$manifest_path" "$eval_report" "$eval_threshold" <<'PY' || log "WARNING: manifest backfill failed for $manifest_path"
+import json, sys
+manifest_path, eval_path, threshold = sys.argv[1:4]
+try:
+    with open(manifest_path) as fh: m = json.load(fh)
+    with open(eval_path) as fh: r = json.load(fh)
+except Exception as e:
+    sys.exit(f"backfill: {e}")
+m["eval_report"] = {
+    "positive_recall": r.get("positive_recall"),
+    "observed_far_per_hour": r.get("observed_far_per_hour"),
+    "false_alarms": r.get("false_alarms"),
+    "negative_hours_evaluated": r.get("negative_hours_evaluated"),
+    "positives_evaluated": r.get("positives_evaluated"),
+    "negatives_evaluated": r.get("negatives_evaluated"),
+    "hard_negatives_mined": r.get("hard_negatives_mined"),
+    "report_path": eval_path,
+}
+try:
+    t = float(threshold)
+    if 0.0 < t < 1.0:
+        m["threshold_suggestion"] = t
+except (ValueError, TypeError):
+    pass
+tmp = manifest_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(m, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+import os
+os.replace(tmp, manifest_path)
+PY
+      # Backfill the phrases-entry sidecar's threshold too, if it exists.
+      local phrases_entry_path="$custom_models_dir/${artifact_name}.phrases-entry.json"
+      if [[ -f "$phrases_entry_path" && -n "$eval_threshold" ]]; then
+        python3 - "$phrases_entry_path" "$eval_threshold" <<'PY' || true
+import json, sys, os
+path, threshold = sys.argv[1:3]
+try:
+    with open(path) as fh: e = json.load(fh)
+    t = float(threshold)
+    if 0.0 < t < 1.0:
+        e["threshold"] = t
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(e, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+except Exception:
+    pass
+PY
+      fi
+    done
+  fi
+
+  # Eval gate (per Piranesi 2026-04-27 ship #3): if device profile
+  # specifies an `eval_gate` block in device_workflows.json, fail the
+  # build with exit code 2 when observed metrics fall outside the gate.
+  # No gate configured ⇒ no gate enforced (preserves backwards compat).
+  if (( eval_ran == 1 )) && [[ -n "${DEVICE_ID:-}" ]] && [[ -n "$eval_recall" && -n "$eval_far_per_hour" ]]; then
+    local workflows_json="$script_dir/device_workflows.json"
+    if [[ -r "$workflows_json" ]]; then
+      mapfile -t _gate_thresholds < <(python3 - "$workflows_json" "$DEVICE_ID" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception:
+    print(""); print(""); sys.exit(0)
+target = sys.argv[2]
+gate = None
+for dev in d.get("devices", []):
+    if dev.get("id") == target:
+        gate = dev.get("eval_gate")
+        break
+if not isinstance(gate, dict):
+    print(""); print("")
+    sys.exit(0)
+print(gate.get("max_far_per_hour", ""))
+print(gate.get("min_recall", ""))
+PY
+)
+      local gate_max_far="${_gate_thresholds[0]:-}"
+      local gate_min_recall="${_gate_thresholds[1]:-}"
+      if [[ -n "$gate_max_far" && -n "$gate_min_recall" ]]; then
+        log "Eval gate (device=$DEVICE_ID): max_far_per_hour=$gate_max_far min_recall=$gate_min_recall"
+        local gate_pass="yes"
+        if python3 -c "import sys; sys.exit(0 if float('$eval_far_per_hour') <= float('$gate_max_far') else 1)" 2>/dev/null; then
+          :
+        else
+          log "Eval gate FAIL: observed_far_per_hour=$eval_far_per_hour > max_far_per_hour=$gate_max_far"
+          gate_pass="no"
+        fi
+        if python3 -c "import sys; sys.exit(0 if float('$eval_recall') >= float('$gate_min_recall') else 1)" 2>/dev/null; then
+          :
+        else
+          log "Eval gate FAIL: positive_recall=$eval_recall < min_recall=$gate_min_recall"
+          gate_pass="no"
+        fi
+        if [[ "$gate_pass" == "no" ]]; then
+          die_with_code "Eval gate failed for device=$DEVICE_ID (recall=$eval_recall far_per_hour=$eval_far_per_hour)" 2 "eval_gate"
+        fi
+        log "Eval gate PASS"
+      else
+        log "Eval gate not configured for device=$DEVICE_ID — skipping gate enforcement"
+      fi
     fi
   fi
 
