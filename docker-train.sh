@@ -500,6 +500,7 @@ docker compose run --rm \
   -e WYOMING_PIPER_PORT=10200 \
   -e WYOMING_OPENWAKEWORD_HOST=openwakeword \
   -e WYOMING_OPENWAKEWORD_PORT=10400 \
+  -e DEVICE_ID="$DEVICE_ID" \
   trainer "${CMD[@]}"
 
 EXIT_CODE=$?

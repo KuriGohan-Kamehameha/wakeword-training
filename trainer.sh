@@ -1102,11 +1102,16 @@ PY
   done
 
   local closed_loop_eval="$script_dir/closed_loop_eval.py"
+  local eval_report=""
+  local eval_ran=0
+  local eval_recall=""
+  local eval_far_per_hour=""
+  local eval_threshold=""
   if [[ -n "$eval_model" && -f "$closed_loop_eval" ]]; then
     local feature_dir="$run_dir/$model_slug"
     local eval_pos_dir="$feature_dir/positive_test"
     local eval_neg_dir="$feature_dir/negative_test"
-    local eval_report="$run_dir/evaluation/closed_loop_report.json"
+    eval_report="$run_dir/evaluation/closed_loop_report.json"
     local hard_neg_dir="$data_dir/hard_negatives/$model_slug"
     local target_far_per_hour="${TARGET_FALSE_ALARMS_PER_HOUR:-0.1}"
     local closed_loop_max_clips="${CLOSED_LOOP_MAX_CLIPS:-600}"
@@ -1114,6 +1119,9 @@ PY
     mkdir -p "$(dirname "$eval_report")" "$hard_neg_dir"
     if [[ -d "$eval_pos_dir" && -d "$eval_neg_dir" ]]; then
       log "Running closed-loop evaluation + hard-negative mining"
+      # Eval is no longer a soft-fail. A trainer that produces a model
+      # which can't be evaluated is producing a model nobody can trust;
+      # propagate the failure so CI / deploy automation see it.
       python3 "$closed_loop_eval" \
         --model-path "$eval_model" \
         --positives-dir "$eval_pos_dir" \
@@ -1122,10 +1130,145 @@ PY
         --max-clips "$closed_loop_max_clips" \
         --hard-negatives-dir "$hard_neg_dir" \
         --max-mined "$max_mined_hard_negatives" \
-        --report-path "$eval_report" \
-        || log "WARNING: closed-loop evaluation failed; continuing."
+        --report-path "$eval_report"
+      eval_ran=1
+      # Pull metrics for gate + manifest backfill.
+      mapfile -t _eval_metrics < <(python3 - "$eval_report" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        r = json.load(fh)
+except Exception:
+    print(""); print(""); print("")
+    sys.exit(0)
+print(r.get("positive_recall", ""))
+print(r.get("observed_far_per_hour", ""))
+print(r.get("recommended_threshold", ""))
+PY
+)
+      eval_recall="${_eval_metrics[0]:-}"
+      eval_far_per_hour="${_eval_metrics[1]:-}"
+      eval_threshold="${_eval_metrics[2]:-}"
+      log "Eval: recall=${eval_recall} far_per_hour=${eval_far_per_hour} threshold=${eval_threshold}"
     else
       log "WARNING: Skipping closed-loop eval (missing clip dirs: $eval_pos_dir / $eval_neg_dir)"
+    fi
+  fi
+
+  # Backfill the manifest sidecar with eval results so downstream consumers
+  # (Piranesi-shaped phrases-entry, future --deploy-to) see threshold +
+  # observed metrics in the same JSON they already read.
+  if (( eval_ran == 1 )) && [[ -n "$eval_report" && -f "$eval_report" ]]; then
+    for f in "${tflites[@]}" "${onnxes[@]}"; do
+      [[ -n "$f" && -f "$f" ]] || continue
+      local artifact_name; artifact_name="$(basename -- "$f")"
+      local manifest_path="$custom_models_dir/${artifact_name}.json"
+      [[ -f "$manifest_path" ]] || continue
+      python3 - "$manifest_path" "$eval_report" "$eval_threshold" <<'PY' || log "WARNING: manifest backfill failed for $manifest_path"
+import json, sys
+manifest_path, eval_path, threshold = sys.argv[1:4]
+try:
+    with open(manifest_path) as fh: m = json.load(fh)
+    with open(eval_path) as fh: r = json.load(fh)
+except Exception as e:
+    sys.exit(f"backfill: {e}")
+m["eval_report"] = {
+    "positive_recall": r.get("positive_recall"),
+    "observed_far_per_hour": r.get("observed_far_per_hour"),
+    "false_alarms": r.get("false_alarms"),
+    "negative_hours_evaluated": r.get("negative_hours_evaluated"),
+    "positives_evaluated": r.get("positives_evaluated"),
+    "negatives_evaluated": r.get("negatives_evaluated"),
+    "hard_negatives_mined": r.get("hard_negatives_mined"),
+    "report_path": eval_path,
+}
+try:
+    t = float(threshold)
+    if 0.0 < t < 1.0:
+        m["threshold_suggestion"] = t
+except (ValueError, TypeError):
+    pass
+tmp = manifest_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(m, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+import os
+os.replace(tmp, manifest_path)
+PY
+      # Backfill the phrases-entry sidecar's threshold too, if it exists.
+      local phrases_entry_path="$custom_models_dir/${artifact_name}.phrases-entry.json"
+      if [[ -f "$phrases_entry_path" && -n "$eval_threshold" ]]; then
+        python3 - "$phrases_entry_path" "$eval_threshold" <<'PY' || true
+import json, sys, os
+path, threshold = sys.argv[1:3]
+try:
+    with open(path) as fh: e = json.load(fh)
+    t = float(threshold)
+    if 0.0 < t < 1.0:
+        e["threshold"] = t
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(e, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+except Exception:
+    pass
+PY
+      fi
+    done
+  fi
+
+  # Eval gate (per Piranesi 2026-04-27 ship #3): if device profile
+  # specifies an `eval_gate` block in device_workflows.json, fail the
+  # build with exit code 2 when observed metrics fall outside the gate.
+  # No gate configured ⇒ no gate enforced (preserves backwards compat).
+  if (( eval_ran == 1 )) && [[ -n "${DEVICE_ID:-}" ]] && [[ -n "$eval_recall" && -n "$eval_far_per_hour" ]]; then
+    local workflows_json="$script_dir/device_workflows.json"
+    if [[ -r "$workflows_json" ]]; then
+      mapfile -t _gate_thresholds < <(python3 - "$workflows_json" "$DEVICE_ID" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception:
+    print(""); print(""); sys.exit(0)
+target = sys.argv[2]
+gate = None
+for dev in d.get("devices", []):
+    if dev.get("id") == target:
+        gate = dev.get("eval_gate")
+        break
+if not isinstance(gate, dict):
+    print(""); print("")
+    sys.exit(0)
+print(gate.get("max_far_per_hour", ""))
+print(gate.get("min_recall", ""))
+PY
+)
+      local gate_max_far="${_gate_thresholds[0]:-}"
+      local gate_min_recall="${_gate_thresholds[1]:-}"
+      if [[ -n "$gate_max_far" && -n "$gate_min_recall" ]]; then
+        log "Eval gate (device=$DEVICE_ID): max_far_per_hour=$gate_max_far min_recall=$gate_min_recall"
+        local gate_pass="yes"
+        if python3 -c "import sys; sys.exit(0 if float('$eval_far_per_hour') <= float('$gate_max_far') else 1)" 2>/dev/null; then
+          :
+        else
+          log "Eval gate FAIL: observed_far_per_hour=$eval_far_per_hour > max_far_per_hour=$gate_max_far"
+          gate_pass="no"
+        fi
+        if python3 -c "import sys; sys.exit(0 if float('$eval_recall') >= float('$gate_min_recall') else 1)" 2>/dev/null; then
+          :
+        else
+          log "Eval gate FAIL: positive_recall=$eval_recall < min_recall=$gate_min_recall"
+          gate_pass="no"
+        fi
+        if [[ "$gate_pass" == "no" ]]; then
+          die_with_code "Eval gate failed for device=$DEVICE_ID (recall=$eval_recall far_per_hour=$eval_far_per_hour)" 2 "eval_gate"
+        fi
+        log "Eval gate PASS"
+      else
+        log "Eval gate not configured for device=$DEVICE_ID — skipping gate enforcement"
+      fi
     fi
   fi
 
