@@ -48,7 +48,39 @@ USAGE
 
 timestamp_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] $*" >&2; }
-die() { echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $*" >&2; exit 1; }
+
+# Structured exit codes for machine-consumable failure parsing.
+# 0 = success
+# 1 = generic / inherited fatal (legacy die() callers)
+# 2 = eval gate failed (FPR / recall thresholds in device_workflows.json)
+# 3 = dataset insufficient (zero positives or negatives)
+# 4 = docker / environment failure
+# 5 = config error (bad flags, missing device profile, etc.)
+#
+# The last line on stderr for any non-zero exit is a JSON blob
+# {"exit_code","reason","details"} so downstream tools (CI, deploy
+# automation, vector-override install scripts) can parse without
+# scraping free-text logs.
+emit_structured_exit() {
+  local rc="$1" reason="$2" details="${3:-}"
+  python3 -c 'import json, sys; print(json.dumps({"exit_code": int(sys.argv[1]), "reason": sys.argv[2], "details": sys.argv[3]}))' \
+    "$rc" "$reason" "$details" >&2 || true
+}
+
+die() {
+  echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $*" >&2
+  emit_structured_exit 1 "fatal" "$*"
+  exit 1
+}
+
+# die_with_code <message> <exit_code> <reason>
+# Use for new exit paths with semantic exit codes (2..5).
+die_with_code() {
+  local msg="$1" rc="${2:-1}" reason="${3:-fatal}"
+  echo "[$(timestamp_utc)] [$SCRIPT_NAME] FATAL: $msg" >&2
+  emit_structured_exit "$rc" "$reason" "$msg"
+  exit "$rc"
+}
 
 on_err() {
   local exit_code=$?
@@ -756,8 +788,8 @@ PY
   local selected_pos="${dataset_counts[0]:-0}"
   local selected_neg="${dataset_counts[1]:-0}"
 
-  (( selected_pos > 0 )) || die "Dataset manifest has zero positive samples."
-  (( selected_neg > 0 )) || die "Dataset manifest has zero negative samples."
+  (( selected_pos > 0 )) || die_with_code "Dataset manifest has zero positive samples." 3 "dataset_insufficient"
+  (( selected_neg > 0 )) || die_with_code "Dataset manifest has zero negative samples." 3 "dataset_insufficient"
 
   export OMP_NUM_THREADS="$train_threads"
   export OPENBLAS_NUM_THREADS=1
@@ -955,6 +987,63 @@ PY
   elif [[ ${#onnxes[@]} -gt 0 ]]; then
     eval_model="${onnxes[0]}"
   fi
+
+  # Sidecar manifest — every model artifact gets a <slug>.tflite.json (or
+  # <slug>.onnx.json) next to it with training params, voices used, repo
+  # SHA, openWakeWord version, device target. Universal substrate for
+  # every downstream integration (Piranesi-shaped emit, --deploy-to,
+  # future wakeword-install skill). One source of truth per model.
+  local manifest_repo_sha="unknown"
+  if command -v git >/dev/null 2>&1 && [[ -d "$script_dir/.git" || -f "$script_dir/.git" ]]; then
+    manifest_repo_sha="$(git -C "$script_dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  fi
+  local manifest_oww_version="unknown"
+  manifest_oww_version="$(python3 -c 'import openwakeword; print(getattr(openwakeword, "__version__", "unknown"))' 2>/dev/null || echo unknown)"
+  local manifest_built_at; manifest_built_at="$(timestamp_utc)"
+  local manifest_voices_csv="${PIPER_VOICES_USED:-}"
+
+  for f in "${tflites[@]}" "${onnxes[@]}"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    local artifact_name; artifact_name="$(basename -- "$f")"
+    local artifact_dest="$custom_models_dir/$artifact_name"
+    local manifest_path="${artifact_dest}.json"
+    python3 - "$manifest_path" "$artifact_name" "$wake_phrase" "$model_slug" \
+                "$num_positives" "$num_negatives" "$train_profile" "$train_threads" \
+                "$manifest_built_at" "$manifest_repo_sha" "$manifest_oww_version" \
+                "${DEVICE_ID:-}" "$manifest_voices_csv" <<'PY' || die_with_code "manifest emit failed for $artifact_name" 4 "manifest_io"
+import json, sys, os
+(path, artifact, phrase, slug, n_pos, n_neg, profile, threads,
+ built_at, repo_sha, oww_ver, device_id, voices_csv) = sys.argv[1:14]
+voices = [v.strip() for v in voices_csv.split(",") if v.strip()] if voices_csv else []
+manifest = {
+    "schema": "wakeword-training/manifest@v1",
+    "phrase": phrase,
+    "slug": slug,
+    "artifact": artifact,
+    "device_target": device_id or None,
+    "training_params": {
+        "positives": int(n_pos) if str(n_pos).isdigit() else None,
+        "negatives": int(n_neg) if str(n_neg).isdigit() else None,
+        "profile": profile,
+        "threads": int(threads) if str(threads).isdigit() else None,
+    },
+    "piper_voices_used": voices,
+    "built_at": built_at,
+    "repo_sha": repo_sha,
+    "openwakeword_version": oww_ver,
+    "threshold_suggestion": None,
+    "eval_report": None,
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(manifest, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, path)
+print(f"manifest: {path}", file=sys.stderr)
+PY
+    log "Manifest emitted: $manifest_path"
+  done
 
   local closed_loop_eval="$script_dir/closed_loop_eval.py"
   if [[ -n "$eval_model" && -f "$closed_loop_eval" ]]; then
