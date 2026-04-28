@@ -82,4 +82,47 @@ Each generation run appends only unique files and does not discard prior samples
 - `wakeword_lab/data/custom_models/`: exported model artifacts
 - `wakeword_lab/data/training_runs/`: run artifacts and logs
 
+## Artifacts
+
+Each model written to `custom_models/` ships with a sidecar manifest and (optionally) a Piranesi-shaped phrase entry:
+
+- `<slug>.<format>` — the model itself (e.g., `hey-piranesi.tflite`)
+- `<slug>.<format>.json` — manifest: phrase, training params, voices used, repo SHA, openwakeword version, device target, threshold suggestion, eval report
+- `<slug>.<format>.phrases-entry.json` — opt-in via `--emit-piranesi-entry`. Drops directly into Piranesi's `state/wakeword/phrases.json` (`vector-override` skill consumes it). Threshold sourced from the manifest's eval recommendation; `enabled: false` by default
+
+Trainer exit codes (machine-consumable; last line on stderr is a JSON `{exit_code, reason, details}` blob on failure):
+
+| code | meaning |
+|-----:|---------|
+| 0 | success, all gates passed |
+| 1 | generic / inherited fatal |
+| 2 | eval gate failed (false-positive rate or recall below threshold in `device_workflows.json`) |
+| 3 | dataset insufficient (zero positives or negatives) |
+| 4 | docker / environment failure |
+| 5 | config error (bad flags, missing device profile) |
+
+## Training a Piranesi-shaped wake word
+
+Piranesi's TTS path uses `en_US-lessac-low` for spoken output, which means a Vector running Piranesi's vector-override speaks in Lessac's voice. **Do not use `en_US-lessac-low` for positive sample generation when training a wake word that Piranesi himself might trigger** — it creates a feedback loop where the model learns to fire on Piranesi's own speech. Use the default diverse Piper pool (which prefers `*-high` voices, not `*-low`), or explicitly select 3+ voices that are not lessac-low.
+
+Quick start:
+
+```bash
+./docker-train.sh \
+  --wake-phrase "Hey Piranesi" \
+  --device anki_vector_wirepod \
+  --threads 2 \
+  --format tflite \
+  --emit-piranesi-entry
+```
+
+Then on the Piranesi host:
+
+```bash
+cp wakeword_lab/data/custom_models/hey-piranesi.tflite \
+   ~/Piranesi/openclaw/workspace/state/wakeword/models/
+# Edit phrases.json: paste contents of hey-piranesi.tflite.phrases-entry.json
+# into the phrases array, then flip enabled:true.
+```
+
 For more operational detail, see `README-docker.md`.

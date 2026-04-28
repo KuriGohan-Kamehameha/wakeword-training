@@ -34,6 +34,9 @@ Options:
   --wyoming-oww-port PORT    Optional connectivity probe target.
   --non-interactive          Skip prompts and use defaults.
   --no-tmux                  Accepted for compatibility (ignored).
+  --emit-piranesi-entry      Emit a <slug>.phrases-entry.json sidecar
+                             shaped for Piranesi's vector-override
+                             receiver (state/wakeword/phrases.json).
   --help, -h                 Show this help.
 
 Environment overrides:
@@ -276,6 +279,7 @@ CLI_DATA_DIR=""
 CLI_MIN_FREE_DISK_GB=""
 CLI_ALLOW_LOW_DISK=0
 CLI_WAKE_PHRASE=""
+CLI_EMIT_PIRANESI_ENTRY=0
 CLI_TRAIN_PROFILE=""
 CLI_TRAIN_THREADS=""
 CLI_MODEL_FORMAT=""
@@ -438,6 +442,10 @@ parse_args() {
         ;;
       --no-tmux)
         CLI_NO_TMUX=1
+        shift
+        ;;
+      --emit-piranesi-entry)
+        CLI_EMIT_PIRANESI_ENTRY=1
         shift
         ;;
       --)
@@ -1043,6 +1051,54 @@ os.replace(tmp, path)
 print(f"manifest: {path}", file=sys.stderr)
 PY
     log "Manifest emitted: $manifest_path"
+
+    # Piranesi-shaped emit (--emit-piranesi-entry): write a sibling
+    # <artifact>.phrases-entry.json with exactly the per-phrase object
+    # shape vector-override's state/wakeword/phrases.json expects. User
+    # pastes one block — closes the integration fault line.
+    # Threshold sourced from the manifest's threshold_suggestion when the
+    # eval gate (ship #3) populates it; falls back to 0.5 when eval did
+    # not run or did not produce a recommendation. enabled defaults to
+    # false — Sat flips per-phrase after dropping the model on Piranesi.
+    if [[ "${CLI_EMIT_PIRANESI_ENTRY:-0}" -eq 1 ]]; then
+      local phrases_entry_path="${artifact_dest}.phrases-entry.json"
+      python3 - "$phrases_entry_path" "$manifest_path" "$wake_phrase" "$model_slug" \
+                "$artifact_name" "$manifest_built_at" <<'PY' || die_with_code "phrases-entry emit failed for $artifact_name" 4 "phrases_entry_io"
+import json, sys, os
+(out_path, manifest_path, phrase, slug, artifact, built_at) = sys.argv[1:7]
+threshold = 0.5
+try:
+    with open(manifest_path) as fh:
+        m = json.load(fh)
+    sug = m.get("threshold_suggestion")
+    if isinstance(sug, (int, float)) and 0.0 < sug < 1.0:
+        threshold = float(sug)
+except Exception:
+    pass
+entry = {
+    "schema": "vector-override/phrases-entry@v1",
+    "slug": slug,
+    "phrase": phrase,
+    "model": artifact,
+    "trained_at": built_at,
+    "threshold": threshold,
+    "route": {
+        "action": "takeover",
+        "default_esn": None,
+        "speak_template": None,
+    },
+    "enabled": False,
+}
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+tmp = out_path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(entry, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, out_path)
+print(f"phrases-entry: {out_path}", file=sys.stderr)
+PY
+      log "Piranesi phrases-entry emitted: $phrases_entry_path"
+    fi
   done
 
   local closed_loop_eval="$script_dir/closed_loop_eval.py"
