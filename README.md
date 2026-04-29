@@ -65,6 +65,12 @@ Each generation run appends only unique files and does not discard prior samples
 | Home Assistant Voice (ESPHome) | `esphome_generic` | `tflite` | `tiny` | 2-4 | <=50 KB |
 | Home Assistant server | `custom_manual` | `tflite` | `medium` | 2-4 | <=200 KB |
 
+## Trust boundary
+
+`wakeword_web.py` is a privileged surface — it synthesizes audio, spawns Docker via the trainer, writes to disk under `BASE_DIR`, and exposes log contents to the caller. **It binds `127.0.0.1` by default.** To expose on the LAN (or any non-loopback interface), set `WAKEWORD_WEB_BIND_ALL=1` in the environment. Even then, there is no built-in authentication — the operator owns the trust decision.
+
+User-supplied `piper_host` / `oww_host` / `piper_port` / `oww_port` are regex-validated before being passed to the trainer subprocess; rejected inputs return HTTP 400 rather than silently rewriting (silent rewrite hides probing).
+
 ## Reliability/performance notes
 
 - Health checks fail fast if `piper`/`openwakeword` do not become healthy.

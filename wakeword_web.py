@@ -1,15 +1,60 @@
 import subprocess
 import os
+import re
 import time
 import threading
 import json
 
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
+# Trust boundary (audit 2026-04-27, hot-fix W-2 + W-6):
+# This Flask app is a privileged surface — it synthesizes audio, spawns
+# Docker via the trainer, writes to disk under BASE_DIR, and exposes log
+# contents to the caller. It MUST NOT be reachable from untrusted networks.
+# Default bind is 127.0.0.1; LAN-or-wider exposure requires explicit opt-in
+# via WAKEWORD_WEB_BIND_ALL=1 in the environment, and even then there is no
+# authentication — the operator owns the trust decision.
+# User-supplied subprocess-env values (piper_host, oww_host) are regex-
+# validated before being passed to the trainer; rejected inputs return 400.
+
 APP_DIR = os.path.dirname(__file__)
 BASE_DIR = os.environ.get("BASE_DIR", "/workspace/data")
 TRAINER_SH = os.path.join(APP_DIR, "trainer.sh")
 WORKFLOWS_PATH = os.path.join(APP_DIR, "device_workflows.json")
+
+# Hostname/IPv4 with optional :port suffix.
+_HOST_PORT_RE = re.compile(
+    r"^(?:[A-Za-z0-9]([A-Za-z0-9_.\-]{0,253}[A-Za-z0-9])?)(?::[0-9]{1,5})?$"
+)
+_PORT_RE = re.compile(r"^[0-9]{1,5}$")
+
+
+def _validate_host(value, default):
+    """Return value if it matches the host[:port] pattern, else default.
+    Hot-fix W-6 (audit 2026-04-27): user input passes to subprocess env,
+    so reject anything that isn't a plausible hostname or IPv4 literal.
+    Empty / missing values fall back to default."""
+    if not isinstance(value, str) or not value:
+        return default
+    if not _HOST_PORT_RE.match(value):
+        return None
+    return value
+
+
+def _validate_port(value, default):
+    """Return int(value) when value is 1-65535, else default. None on bad
+    non-empty input so the caller can return 400."""
+    if value is None or value == "":
+        return default
+    if not isinstance(value, str) or not _PORT_RE.match(value):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= port <= 65535):
+        return None
+    return port
 
 
 def load_workflows():
@@ -283,10 +328,10 @@ def start():
     profile = request.form.get('profile', 'medium')
     threads = request.form.get('threads', '1')
     model_format = request.form.get('format', 'tflite')
-    piper_host = request.form.get('piper_host', 'piper')
-    piper_port = request.form.get('piper_port', '10200')
-    oww_host = request.form.get('oww_host', 'openwakeword')
-    oww_port = request.form.get('oww_port', '10400')
+    piper_host_raw = request.form.get('piper_host', 'piper')
+    piper_port_raw = request.form.get('piper_port', '10200')
+    oww_host_raw = request.form.get('oww_host', 'openwakeword')
+    oww_port_raw = request.form.get('oww_port', '10400')
     preset_id = request.form.get('sample_preset', DEFAULT_PRESET_ID)
 
     device = DEVICE_MAP.get(device_id, {})
@@ -295,25 +340,31 @@ def start():
         profile = device.get('profile', defaults.get('profile', profile))
         threads = device.get('threads', defaults.get('threads', threads))
         model_format = device.get('default_format', defaults.get('default_format', model_format))
-        piper_host = device.get('piper_host', defaults.get('piper_host', piper_host))
-        piper_port = device.get('piper_port', defaults.get('piper_port', piper_port))
-        oww_host = device.get('oww_host', defaults.get('oww_host', oww_host))
-        oww_port = device.get('oww_port', defaults.get('oww_port', oww_port))
+        piper_host_raw = device.get('piper_host', defaults.get('piper_host', piper_host_raw))
+        piper_port_raw = device.get('piper_port', defaults.get('piper_port', piper_port_raw))
+        oww_host_raw = device.get('oww_host', defaults.get('oww_host', oww_host_raw))
+        oww_port_raw = device.get('oww_port', defaults.get('oww_port', oww_port_raw))
 
     try:
         threads = int(threads)
     except (TypeError, ValueError):
         threads = defaults.get('threads', 1)
 
-    try:
-        piper_port = int(piper_port)
-    except (TypeError, ValueError):
-        piper_port = defaults.get('piper_port', 10200)
-
-    try:
-        oww_port = int(oww_port)
-    except (TypeError, ValueError):
-        oww_port = defaults.get('oww_port', 10400)
+    # Hot-fix W-6: validate user-supplied host/port values before passing
+    # to subprocess env. Reject (return 400) on bad input rather than
+    # silently rewriting; silent rewrite hides probing.
+    piper_host = _validate_host(str(piper_host_raw), 'piper')
+    oww_host = _validate_host(str(oww_host_raw), 'openwakeword')
+    piper_port = _validate_port(str(piper_port_raw), defaults.get('piper_port', 10200))
+    oww_port = _validate_port(str(oww_port_raw), defaults.get('oww_port', 10400))
+    if piper_host is None:
+        return jsonify(error="invalid piper_host"), 400
+    if oww_host is None:
+        return jsonify(error="invalid oww_host"), 400
+    if piper_port is None:
+        return jsonify(error="invalid piper_port"), 400
+    if oww_port is None:
+        return jsonify(error="invalid oww_port"), 400
 
     os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -444,4 +495,16 @@ def log():
         return jsonify(log=f'Error reading log: {e}')
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    # Hot-fix W-2: bind 127.0.0.1 by default. Set WAKEWORD_WEB_BIND_ALL=1
+    # to expose on 0.0.0.0 (LAN-or-wider). The trainer is a privileged
+    # surface (synthesizes audio, spawns Docker, writes disk, exposes
+    # logs); LAN-by-default is wrong even on a trusted home network.
+    bind_all = os.environ.get("WAKEWORD_WEB_BIND_ALL", "").strip() in ("1", "true", "yes")
+    host = "0.0.0.0" if bind_all else "127.0.0.1"
+    if bind_all:
+        print(
+            "WARNING: WAKEWORD_WEB_BIND_ALL=1 — binding 0.0.0.0 with no auth. "
+            "Restrict at the network layer or revoke this env var.",
+            flush=True,
+        )
+    app.run(host=host, port=int(os.environ.get("PORT", "5000")))
