@@ -1010,18 +1010,33 @@ PY
   local manifest_built_at; manifest_built_at="$(timestamp_utc)"
   local manifest_voices_csv="${PIPER_VOICES_USED:-}"
 
+  # Read selected counts from the dataset_counts array (set after
+  # generate_dataset.py at line 788-789). Passing $num_positives /
+  # $num_negatives by name would silently give us empty strings — those
+  # bash vars are never defined. Hot-fix W-1 (audit 2026-04-27).
+  local manifest_pos="${dataset_counts[0]:-}"
+  local manifest_neg="${dataset_counts[1]:-}"
+
   for f in "${tflites[@]}" "${onnxes[@]}"; do
     [[ -n "$f" && -f "$f" ]] || continue
     local artifact_name; artifact_name="$(basename -- "$f")"
     local artifact_dest="$custom_models_dir/$artifact_name"
     local manifest_path="${artifact_dest}.json"
     python3 - "$manifest_path" "$artifact_name" "$wake_phrase" "$model_slug" \
-                "$num_positives" "$num_negatives" "$train_profile" "$train_threads" \
+                "$manifest_pos" "$manifest_neg" "$train_profile" "$train_threads" \
                 "$manifest_built_at" "$manifest_repo_sha" "$manifest_oww_version" \
                 "${DEVICE_ID:-}" "$manifest_voices_csv" <<'PY' || die_with_code "manifest emit failed for $artifact_name" 4 "manifest_io"
 import json, sys, os
 (path, artifact, phrase, slug, n_pos, n_neg, profile, threads,
  built_at, repo_sha, oww_ver, device_id, voices_csv) = sys.argv[1:14]
+# Hot-fix W-1: fail loud on null counts. A manifest with
+# training_params.positives=null is structurally valid but semantically
+# empty and will silently corrupt every downstream consumer that reads
+# it. P10: assert at boundary.
+positives = int(n_pos) if str(n_pos).isdigit() else None
+negatives = int(n_neg) if str(n_neg).isdigit() else None
+assert positives is not None, f"manifest emit got null positives count (raw={n_pos!r}); dataset_counts unset?"
+assert negatives is not None, f"manifest emit got null negatives count (raw={n_neg!r}); dataset_counts unset?"
 voices = [v.strip() for v in voices_csv.split(",") if v.strip()] if voices_csv else []
 manifest = {
     "schema": "wakeword-training/manifest@v1",
@@ -1030,8 +1045,8 @@ manifest = {
     "artifact": artifact,
     "device_target": device_id or None,
     "training_params": {
-        "positives": int(n_pos) if str(n_pos).isdigit() else None,
-        "negatives": int(n_neg) if str(n_neg).isdigit() else None,
+        "positives": positives,
+        "negatives": negatives,
         "profile": profile,
         "threads": int(threads) if str(threads).isdigit() else None,
     },
