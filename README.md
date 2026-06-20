@@ -2,6 +2,12 @@
 
 Docker-first wakeword training for openWakeWord, with an end-to-end workflow that runs from one command.
 
+## Part of the Piranesi voice stack
+
+The **wake-word detector** half. Its sibling is **[AVAAS](https://github.com/P1R4N351/AVAAS)** — *Automated Voice Assimilation and Application System*, a browser studio that records and standardizes a voice into a corpus for TTS fine-tuning.
+
+They connect end to end: **AVAAS assimilates the voice → this trains the wake word for it.** Once AVAAS can synthesize a voice, it can produce *personalized* positive samples of the wake phrase **in that voice** to feed the sample-generation step here (alongside or instead of the generic `piper-sample-generator` voices) — yielding a detector tuned to how the speaker actually says it, not a generic TTS approximation.
+
 ## Platform support
 
 - Linux: supported (`bash`, Docker Engine + Compose plugin)

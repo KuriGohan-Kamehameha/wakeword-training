@@ -123,11 +123,21 @@ convert_onnx_with_onnx2tf() {
     python3 -m venv "$venv_dir"
   fi
 
+  # Bug-hunt iter 478: source without size cap — venv_dir path is influenced
+  # by ONNX2TF_CACHE_DIR env var; a replaced activate script executes unbounded
+  # shell code.  Same iter-382 class.  Cap at 1 MB; virtualenv activate is always < 10 KB.
+  _activate_sz=$(wc -c < "$venv_dir/bin/activate" 2>/dev/null || echo 0)
+  if (( _activate_sz > 1048576 )); then
+    die "venv activate script too large (${_activate_sz}B > 1 MB): $venv_dir/bin/activate"
+  fi
   # shellcheck disable=SC1091
   source "$venv_dir/bin/activate"
 
   local install_deps=1
-  if [[ -f "$deps_stamp" ]] && [[ "$(cat "$deps_stamp")" == "$deps_key" ]]; then
+  # Bug-hunt iter 702: cat deps_stamp without size cap — iter-330 class.
+  _ds_sz=$(wc -c < "$deps_stamp" 2>/dev/null || echo 0)
+  _ds_val=""; (( _ds_sz <= 4096 )) && _ds_val="$(cat "$deps_stamp" 2>/dev/null || echo '')"
+  if [[ -f "$deps_stamp" ]] && [[ "${_ds_val}" == "$deps_key" ]]; then
     install_deps=0
   fi
 
@@ -212,7 +222,8 @@ prompt_nonempty() {
   local value="${!var_name:-}"
   if [[ -z "$value" ]]; then
     if [[ -t 0 && "${NON_INTERACTIVE:-0}" -ne 1 ]]; then
-      read -r -p "${prompt_text} [${default_value}]: " value || true
+      # Bug-hunt iter 684: read without size cap — iter-386 class.
+      read -r -n 4096 -p "${prompt_text} [${default_value}]: " value || true
       value="${value:-$default_value}"
     else
       value="$default_value"
@@ -234,7 +245,8 @@ prompt_choice() {
   local value="${!var_name:-}"
   if [[ -z "$value" ]]; then
     if [[ -t 0 && "${NON_INTERACTIVE:-0}" -ne 1 ]]; then
-      read -r -p "${prompt_text} [${default_value}] (choices: ${choices[*]}): " value || true
+      # Bug-hunt iter 685: read without size cap — iter-386 class.
+      read -r -n 4096 -p "${prompt_text} [${default_value}] (choices: ${choices[*]}): " value || true
       value="${value:-$default_value}"
     else
       value="$default_value"
@@ -256,12 +268,25 @@ port_open() {
   local host="${1:?}"
   local port="${2:?}"
   local timeout_s="${3:-1}"
-  python3 - <<PY >/dev/null 2>&1
-import socket, sys
+  # Bug-hunt iter 479: $host and $port interpolated into Python heredoc without
+  # validation — iter-227 class (shell variables → Python string injection).
+  # Validate host matches hostname/IP pattern; validate port is numeric 1-65535.
+  if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    log "WARN: port_open: invalid host '$host' — skipping probe"; return 1
+  fi
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    log "WARN: port_open: invalid port '$port' — skipping probe"; return 1
+  fi
+  _PORT_OPEN_HOST="$host" _PORT_OPEN_PORT="$port" _PORT_OPEN_TIMEOUT="$timeout_s" \
+  python3 - <<'PY' >/dev/null 2>&1
+import socket, sys, os
+h = os.environ["_PORT_OPEN_HOST"]
+p = int(os.environ["_PORT_OPEN_PORT"])
+t = float(os.environ["_PORT_OPEN_TIMEOUT"])
 s = socket.socket()
-s.settimeout(${timeout_s})
+s.settimeout(t)
 try:
-    s.connect(("${host}", int(${port})))
+    s.connect((h, p))
     s.close()
     sys.exit(0)
 except Exception:
@@ -620,6 +645,9 @@ import os
 from pathlib import Path
 
 path = Path(os.environ["PIPER_GEN_PY"])
+# Bug-hunt iter 533: read_text() without size cap — iter-330 class.
+if path.stat().st_size > 10 * 1024 * 1024:
+    raise SystemExit(f"piper generate_samples.py too large: {path.stat().st_size}B")
 text = path.read_text(encoding="utf-8")
 needle = "model = torch.load(model_path)"
 patched = "model = torch.load(model_path, weights_only=False)"
@@ -654,10 +682,12 @@ import soundfile as sf
 src = os.environ["SOURCE_NEGATIVE_DIR"]
 dst = os.environ["NORMALIZED_NEGATIVE_DIR"]
 
+# Bug-hunt iter 497: os.listdir without count cap — iter-338 class; NASA P10 Rule 2.
+_MAX_NEG_FILES = 10_000
 wav_files = sorted(
     f for f in os.listdir(src)
     if f.lower().endswith(".wav") and os.path.isfile(os.path.join(src, f))
-)
+)[:_MAX_NEG_FILES]
 if not wav_files:
     raise SystemExit(f"No .wav files found in negative source directory: {src}")
 
@@ -694,22 +724,37 @@ dataset_json = os.environ["DATASET_JSON"]
 piper_generator_dir = os.environ.get("PIPER_SAMPLE_GENERATOR_DIR", "").strip()
 negative_dir = os.environ.get("DATA_NEGATIVE_DIR", "").strip() or os.path.join(run_dir, model_slug, "negative_train")
 
+# Bug-hunt iter 534: yaml.safe_load without size cap — iter-330 class.
+_cfg_sz = os.path.getsize(cfg_path) if os.path.exists(cfg_path) else 0
+if _cfg_sz > 1 * 1024 * 1024:
+    raise SystemExit(f"training_config.yml too large: {_cfg_sz}B")
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
 updated = []
 
+# Bug-hunt iter 708: previously `set_key_recursive` recursed on dict values
+# and list elements — NASA P10 Rule 1 (no recursion) violation.  Replace with
+# an explicit-stack iterative walk bounded by _MAX_NODES (any realistic
+# training_config has well under this).
+_MAX_NODES = 100000
+def set_key_iterative(root, key, value):
+    stack = [root]
+    visited = 0
+    while stack and visited < _MAX_NODES:
+        visited += 1
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k in list(node.keys()):
+                if k == key:
+                    node[k] = value
+                    updated.append(key)
+                else:
+                    stack.append(node[k])
+        elif isinstance(node, list):
+            stack.extend(node)
 def set_key_recursive(obj, key, value):
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            if k == key:
-                obj[k] = value
-                updated.append(key)
-            else:
-                set_key_recursive(obj[k], key, value)
-    elif isinstance(obj, list):
-        for it in obj:
-            set_key_recursive(it, key, value)
+    set_key_iterative(obj, key, value)
 
 for k in ("target_phrase", "target_phrases", "wake_phrase", "wake_phrases"):
     set_key_recursive(cfg, k, [wake_phrase] if k.endswith("s") or k.startswith("target_") else wake_phrase)
@@ -784,9 +829,18 @@ PY
     --min-per-source "$min_per_source" \
     --seed "$dataset_seed"
 
-  mapfile -t dataset_counts < <(python3 - <<PY
-import json
-with open("$dataset_json", "r", encoding="utf-8") as f:
+  # Bug-hunt iter 480: $dataset_json interpolated into unquoted Python heredoc —
+  # iter-227 class; a path with embedded quotes would break the Python string
+  # literal.  Pass via environment variable instead.
+  # Bug-hunt iter 691: mapfile without -n count cap — iter-338 class; Python prints exactly 2 lines.
+  mapfile -t -n 8 dataset_counts < <(DATASET_JSON="$dataset_json" python3 - <<'PY'
+import json, os
+# Bug-hunt iter 535: json.load without size cap — iter-330 class.
+_dsj = os.environ["DATASET_JSON"]
+_dsj_sz = os.path.getsize(_dsj) if os.path.exists(_dsj) else 0
+if _dsj_sz > 10 * 1024 * 1024:
+    raise SystemExit(f"dataset.json too large: {_dsj_sz}B")
+with open(_dsj, "r", encoding="utf-8") as f:
     d = json.load(f)
 s = d.get("summary", {})
 print(int(s.get("selected_positives", 0)))
@@ -847,25 +901,39 @@ import os
 import yaml
 
 cfg_path = os.environ["CFG_PATH"]
+# Bug-hunt iter 536: yaml.safe_load without size cap — iter-330 class.
+_cfg536_sz = os.path.getsize(cfg_path) if os.path.exists(cfg_path) else 0
+if _cfg536_sz > 1 * 1024 * 1024:
+    raise SystemExit(f"training_config.yml too large: {_cfg536_sz}B")
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
 changes = []
 
+# Bug-hunt iter 709: previously `reduce_recursive` recursed on dict/list values —
+# NASA P10 Rule 1 (no recursion) violation.  Replace with an explicit-stack
+# iterative walk bounded by _MAX_NODES.
+_MAX_NODES_REDUCE = 100000
+def reduce_iterative(root, key, factor, minimum):
+    stack = [root]
+    visited = 0
+    while stack and visited < _MAX_NODES_REDUCE:
+        visited += 1
+        node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == key and isinstance(v, (int, float)):
+                    old = int(v)
+                    new = max(minimum, int(round(old * factor)))
+                    if new < old:
+                        node[k] = new
+                        changes.append((key, old, new))
+                else:
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
 def reduce_recursive(obj, key, factor, minimum):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k == key and isinstance(v, (int, float)):
-                old = int(v)
-                new = max(minimum, int(round(old * factor)))
-                if new < old:
-                    obj[k] = new
-                    changes.append((key, old, new))
-            else:
-                reduce_recursive(v, key, factor, minimum)
-    elif isinstance(obj, list):
-        for item in obj:
-            reduce_recursive(item, key, factor, minimum)
+    reduce_iterative(obj, key, factor, minimum)
 
 reduce_recursive(cfg, "n_samples", 0.6, 120)
 reduce_recursive(cfg, "n_samples_val", 0.6, 24)
@@ -887,7 +955,10 @@ PY
       return 1
     }
     run_generate_clips
-    python3 - <<PY
+    # Bug-hunt iter 481: $cfg_out interpolated into unquoted Python heredoc —
+    # iter-227 class; path with embedded quotes would break the string literal.
+    # Pass via environment variable instead.
+    CFG_OUT="$cfg_out" python3 - <<'PY'
 import glob
 import os
 import numpy as np
@@ -895,7 +966,11 @@ import resampy
 import soundfile as sf
 import yaml
 
-cfg_path = "$cfg_out"
+cfg_path = os.environ["CFG_OUT"]
+# Bug-hunt iter 537: yaml.safe_load without size cap — iter-330 class.
+_cfg537_sz = os.path.getsize(cfg_path) if os.path.exists(cfg_path) else 0
+if _cfg537_sz > 1 * 1024 * 1024:
+    raise SystemExit(f"training_config.yml too large: {_cfg537_sz}B")
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
@@ -908,8 +983,9 @@ clip_dirs = [
 ]
 
 processed = 0
+_MAX_CLIP_FILES = 10_000  # Bug-hunt iter 498: glob.glob without count cap — iter-338 class; NASA P10 Rule 2.
 for clip_dir in clip_dirs:
-    for wav_path in glob.glob(os.path.join(clip_dir, "*.wav")):
+    for wav_path in glob.glob(os.path.join(clip_dir, "*.wav"))[:_MAX_CLIP_FILES]:
         audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
         if isinstance(audio, np.ndarray) and audio.ndim > 1:
             audio = np.mean(audio, axis=1)
@@ -929,12 +1005,18 @@ oww_utils.download_models(model_names=["_none_"], target_directory=target)
 print(f"Ensured openWakeWord feature/VAD resources in {target}")
 PY
     python3 openwakeword/train.py --training_config "$cfg_out" --augment_clips
-    python3 - <<PY
+    # Bug-hunt iter 493: $cfg_out interpolated into second unquoted Python heredoc —
+    # iter-227 class (same as iter-481).  Pass via environment variable instead.
+    CFG_OUT="$cfg_out" python3 - <<'PY'
 import os
 import numpy as np
 import yaml
 
-cfg_path = "$cfg_out"
+cfg_path = os.environ["CFG_OUT"]
+# Bug-hunt iter 542: yaml.safe_load without size cap — iter-330 class (fp_validation block).
+_cfg542_sz = os.path.getsize(cfg_path) if os.path.exists(cfg_path) else 0
+if _cfg542_sz > 1 * 1024 * 1024:
+    raise SystemExit(f"training_config.yml too large: {_cfg542_sz}B")
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = yaml.safe_load(f)
 
@@ -961,7 +1043,8 @@ print(f"Prepared false-positive validation features: {fp_validation} shape={arr.
 PY
     python3 openwakeword/train.py --training_config "$cfg_out" --train_model
     if [[ "$model_format" == "tflite" || "$model_format" == "both" ]]; then
-      mapfile -t fallback_onnxes < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+      # Bug-hunt iter 494: mapfile without count cap — iter-338 class; NASA P10 Rule 2.
+      mapfile -t -n 256 fallback_onnxes < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
       [[ ${#fallback_onnxes[@]} -gt 0 ]] || die "No ONNX artifacts found for conversion."
       for onnx_path in "${fallback_onnxes[@]}"; do
         [[ -f "$onnx_path" ]] || continue
@@ -970,8 +1053,9 @@ PY
     fi
   ) 2>&1 | tee -a "$log_file"
 
-  mapfile -t tflites < <(find "$run_dir" "$repo_dir" -type f -name "*.tflite" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
-  mapfile -t onnxes  < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx"  -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+  # Bug-hunt iter 495: mapfile without count cap — iter-338 class; NASA P10 Rule 2.
+  mapfile -t -n 256 tflites < <(find "$run_dir" "$repo_dir" -type f -name "*.tflite" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+  mapfile -t -n 256 onnxes  < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx"  -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
 
   case "$model_format" in
     tflite) onnxes=() ;;
@@ -1148,9 +1232,14 @@ PY
         --report-path "$eval_report"
       eval_ran=1
       # Pull metrics for gate + manifest backfill.
-      mapfile -t _eval_metrics < <(python3 - "$eval_report" <<'PY'
-import json, sys
+      # Bug-hunt iter 692: mapfile without -n count cap — iter-338 class; Python prints exactly 3 lines.
+      mapfile -t -n 8 _eval_metrics < <(python3 - "$eval_report" <<'PY'
+import json, os, sys
 try:
+    # Bug-hunt iter 538: json.load without size cap — iter-330 class.
+    _er_sz = os.path.getsize(sys.argv[1]) if os.path.exists(sys.argv[1]) else 0
+    if _er_sz > 10 * 1024 * 1024:
+        raise SystemExit(f"eval_report too large: {_er_sz}B")
     with open(sys.argv[1]) as fh:
         r = json.load(fh)
 except Exception:
@@ -1180,9 +1269,14 @@ PY
       local manifest_path="$custom_models_dir/${artifact_name}.json"
       [[ -f "$manifest_path" ]] || continue
       python3 - "$manifest_path" "$eval_report" "$eval_threshold" <<'PY' || log "WARNING: manifest backfill failed for $manifest_path"
-import json, sys
+import json, os, sys
 manifest_path, eval_path, threshold = sys.argv[1:4]
 try:
+    # Bug-hunt iter 540: json.load without size cap on manifest and eval — iter-330 class.
+    for _p540, _cap540 in ((manifest_path, 1*1024*1024), (eval_path, 10*1024*1024)):
+        _sz540 = os.path.getsize(_p540) if os.path.exists(_p540) else 0
+        if _sz540 > _cap540:
+            sys.exit(f"backfill: {_p540} too large: {_sz540}B")
     with open(manifest_path) as fh: m = json.load(fh)
     with open(eval_path) as fh: r = json.load(fh)
 except Exception as e:
@@ -1217,6 +1311,10 @@ PY
 import json, sys, os
 path, threshold = sys.argv[1:3]
 try:
+    # Bug-hunt iter 541: json.load without size cap — iter-330 class.
+    _pe_sz = os.path.getsize(path) if os.path.exists(path) else 0
+    if _pe_sz > 1 * 1024 * 1024:
+        raise Exception(f"phrases-entry too large: {_pe_sz}B")
     with open(path) as fh: e = json.load(fh)
     t = float(threshold)
     if 0.0 < t < 1.0:
@@ -1240,9 +1338,14 @@ PY
   if (( eval_ran == 1 )) && [[ -n "${DEVICE_ID:-}" ]] && [[ -n "$eval_recall" && -n "$eval_far_per_hour" ]]; then
     local workflows_json="$script_dir/device_workflows.json"
     if [[ -r "$workflows_json" ]]; then
-      mapfile -t _gate_thresholds < <(python3 - "$workflows_json" "$DEVICE_ID" <<'PY'
-import json, sys
+      # Bug-hunt iter 693: mapfile without -n count cap — iter-338 class; Python prints exactly 2 lines.
+      mapfile -t -n 8 _gate_thresholds < <(python3 - "$workflows_json" "$DEVICE_ID" <<'PY'
+import json, os, sys
 try:
+    # Bug-hunt iter 539: json.load without size cap — iter-330 class.
+    _wj_sz = os.path.getsize(sys.argv[1]) if os.path.exists(sys.argv[1]) else 0
+    if _wj_sz > 10 * 1024 * 1024:
+        raise SystemExit(f"device_workflows.json too large: {_wj_sz}B")
     with open(sys.argv[1]) as fh:
         d = json.load(fh)
 except Exception:

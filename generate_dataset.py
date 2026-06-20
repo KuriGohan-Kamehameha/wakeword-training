@@ -17,6 +17,10 @@ def parse_sources(raw_sources: str) -> list[str]:
 
 
 def collect_files(sources: list[str]) -> dict[str, list[str]]:
+    # Bug-hunt iter 338: path.rglob("*") had no file count cap — a source
+    # directory with millions of files iterated without bound.  NASA P10 Rule 2:
+    # explicit upper bound.  Cap at 100 000 audio files per source.
+    _MAX_FILES_PER_SOURCE = 100_000
     collected: dict[str, list[str]] = {}
     for source in sources:
         path = Path(source).expanduser()
@@ -26,11 +30,13 @@ def collect_files(sources: list[str]) -> dict[str, list[str]]:
         if not path.exists():
             collected[source] = []
             continue
-        files = [
-            str(p)
-            for p in path.rglob("*")
-            if p.is_file() and p.suffix.lower() in AUDIO_EXTS
-        ]
+        files: list[str] = []
+        for p in path.rglob("*"):
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                files.append(str(p))
+                if len(files) >= _MAX_FILES_PER_SOURCE:
+                    print(f"WARNING: {source}: hit {_MAX_FILES_PER_SOURCE} file cap; truncating", flush=True)
+                    break
         collected[source] = files
     return collected
 
@@ -71,7 +77,16 @@ def distribute_diverse(
     else:
         remaining_slots = None
 
-    while True:
+    # Bug-hunt iter 345: `while True:` had no explicit iteration cap — when
+    # max_total is None the loop relied entirely on the deques draining, with no
+    # upper bound visible to a static analyzer.  NASA P10 Rule 2: add an
+    # explicit cap equal to the total files across all sources (a tighter bound
+    # than `while True:` while preserving the existing termination logic).
+    _total_files = sum(len(list(q)) for q in per_source_files.values())
+    _max_iters = _total_files + 1  # +1 for the final made_progress=False cycle
+    _iter = 0
+    while _iter < _max_iters:
+        _iter += 1
         if remaining_slots is not None and remaining_slots <= 0:
             break
         made_progress = False
@@ -103,10 +118,15 @@ def parse_int(value: str, label: str) -> int | None:
         return None
     try:
         parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"{label} must be an integer") from exc
+    except ValueError:
+        # Bug-hunt iter 347: raised argparse.ArgumentTypeError from a direct
+        # call in main() — ArgumentTypeError is only handled by argparse
+        # internally; from a manual call it becomes an uncaught exception
+        # producing a Python traceback instead of a clean error message.
+        # Use SystemExit to get a clean CLI error line.
+        raise SystemExit(f"error: {label} must be an integer (got: {value!r})")
     if parsed < 0:
-        raise argparse.ArgumentTypeError(f"{label} must be >= 0")
+        raise SystemExit(f"error: {label} must be >= 0 (got: {parsed})")
     return parsed
 
 

@@ -16,9 +16,20 @@ AUDIO_EXTS = {".wav"}
 
 
 def collect_wavs(root: Path) -> List[Path]:
+    # Bug-hunt iter 339: root.rglob("*") had no file count cap — a large
+    # negatives-dir iterated without bound.  NASA P10 Rule 2: cap at 50 000
+    # WAV files; anything larger is a configuration error.
+    _MAX_WAVS = 50_000
     if not root.exists():
         return []
-    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
+    files: List[Path] = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+            files.append(p)
+            if len(files) >= _MAX_WAVS:
+                print(f"WARNING: {root}: hit {_MAX_WAVS} file cap; truncating", flush=True)
+                break
+    return sorted(files)
 
 
 def sample_even(paths: List[Path], max_items: int) -> List[Path]:
@@ -29,10 +40,16 @@ def sample_even(paths: List[Path], max_items: int) -> List[Path]:
 
 
 def wav_duration_seconds(path: Path) -> float:
-    with wave.open(str(path), "rb") as wf:
-        nframes = wf.getnframes()
-        rate = wf.getframerate()
-    return float(nframes) / float(rate) if rate > 0 else 0.0
+    # Bug-hunt iter 340: wave.Error from a corrupted WAV file propagated
+    # uncaught through evaluate_clip() to the caller, aborting the entire eval
+    # run over a single bad file.  Return 0.0 on any read failure.
+    try:
+        with wave.open(str(path), "rb") as wf:
+            nframes = wf.getnframes()
+            rate = wf.getframerate()
+        return float(nframes) / float(rate) if rate > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
 def _token_is_identifier(token: str) -> bool:
@@ -124,8 +141,17 @@ def choose_threshold(negatives: List[ClipEval], target_far_per_hour: float, cool
 def mine_hard_negatives(negatives: List[ClipEval], threshold: float, out_dir: Path, max_mined: int) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     existing_keys = set()
+    # Bug-hunt iter 344: out_dir.glob("*.wav") had no count cap — a hard-negatives
+    # dir with hundreds of thousands of files iterated without bound.  NASA P10
+    # Rule 2: cap the existing-key scan at the same _MAX_WAVS ceiling used by
+    # collect_wavs().
+    _KEY_SCAN_CAP = 50_000
+    _scanned = 0
     for wav in out_dir.glob("*.wav"):
         existing_keys.add(semantic_name(wav))
+        _scanned += 1
+        if _scanned >= _KEY_SCAN_CAP:
+            break
 
     mined = 0
     candidates = sorted((c for c in negatives if c.max_score >= threshold), key=lambda x: x.max_score, reverse=True)

@@ -4,9 +4,13 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-WORKFLOWS_JSON="$SCRIPT_DIR/device_workflows.json"
-ORIG_ARGC=$#
+# Bug-hunt iter 321: NASA P10 readonly on constants — SCRIPT_DIR + WORKFLOWS_JSON
+# + ORIG_ARGC set once at script entry, never reassigned.  Same iter-185/281
+# scope-expansion class.  Wakeword trainer is launched from cron/launchd as
+# well as interactively; pinning prevents env drift from rebinding paths.
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly WORKFLOWS_JSON="$SCRIPT_DIR/device_workflows.json"
+readonly ORIG_ARGC=$#
 
 # Defaults
 WAKE_PHRASE="${WAKE_PHRASE:-hey assistant}"
@@ -84,11 +88,15 @@ list_devices() {
   require_cmd python3
   [[ -f "$WORKFLOWS_JSON" ]] || die "Missing $WORKFLOWS_JSON"
   python3 - "$WORKFLOWS_JSON" <<'PY'
-import json,sys
+import json,sys,os
 path=sys.argv[1]
+# Bug-hunt iter 499: json.load without file size cap — iter-330 class.
+if os.path.getsize(path) > 1048576: sys.exit("workflows.json exceeds 1 MB; refusing")
 with open(path,'r',encoding='utf-8') as f:
     data=json.load(f)
-for d in data.get('devices',[]):
+# Bug-hunt iter 500: data.get('devices',[]) without count cap — iter-338 class; NASA P10 Rule 2.
+_MAX_DEVICES = 256
+for d in data.get('devices',[])[:_MAX_DEVICES]:
     did=d.get('id','')
     label=d.get('label',did)
     if did:
@@ -102,12 +110,16 @@ apply_device_defaults() {
 
   local output
   output="$(python3 - "$WORKFLOWS_JSON" "$device_id" <<'PY'
-import json,sys
+import json,sys,os
 path,device_id=sys.argv[1],sys.argv[2]
+# Bug-hunt iter 499: json.load without file size cap — iter-330 class.
+if os.path.getsize(path) > 1048576: sys.exit("workflows.json exceeds 1 MB; refusing")
 with open(path,'r',encoding='utf-8') as f:
     data=json.load(f)
 defaults=data.get('default',{})
-devices={d.get('id'):d for d in data.get('devices',[]) if d.get('id')}
+# Bug-hunt iter 500: data.get('devices',[]) without count cap — iter-338 class; NASA P10 Rule 2.
+_MAX_DEVICES = 256
+devices={d.get('id'):d for d in data.get('devices',[])[:_MAX_DEVICES] if d.get('id')}
 if device_id not in devices:
     print(f"Unknown device id: {device_id}", file=sys.stderr)
     sys.exit(2)
@@ -123,8 +135,10 @@ print(f"label={label}")
 PY
 )" || die "Failed resolving --device '${device_id}'"
 
-  local k v
+  # Bug-hunt iter 681: while-read without count cap — iter-338 class; output has exactly 4 lines but cap defensively.
+  local k v _n681=0
   while IFS='=' read -r k v; do
+    (( _n681 < 16 )) || break; _n681=$(( _n681 + 1 ))
     case "$k" in
       profile)
         if [[ "$PROFILE_SET" -eq 0 ]]; then
@@ -154,18 +168,23 @@ device_exists() {
   command -v python3 >/dev/null 2>&1 || return 1
 
   python3 - "$WORKFLOWS_JSON" "$device_id" <<'PY' >/dev/null 2>&1
-import json,sys
+import json,sys,os
 path,device_id=sys.argv[1],sys.argv[2]
+# Bug-hunt iter 499: json.load without file size cap — iter-330 class.
+if os.path.getsize(path) > 1048576: sys.exit("workflows.json exceeds 1 MB; refusing")
 with open(path,'r',encoding='utf-8') as f:
     data=json.load(f)
-ids={d.get('id') for d in data.get('devices',[]) if d.get('id')}
+# Bug-hunt iter 500: data.get('devices',[]) without count cap — iter-338 class; NASA P10 Rule 2.
+_MAX_DEVICES = 256
+ids={d.get('id') for d in data.get('devices',[])[:_MAX_DEVICES] if d.get('id')}
 sys.exit(0 if device_id in ids else 1)
 PY
 }
 
 prompt_default() {
   local __var="${1:?}" prompt="${2:?}" default="${3-}" input
-  read -r -p "$prompt [$default]: " input || input=""
+  # Bug-hunt iter 686: read without size cap — iter-386 class.
+  read -r -n 4096 -p "$prompt [$default]: " input || input=""
   input="$(trim "$input")"
   if [[ -z "$input" ]]; then
     input="$default"
@@ -175,8 +194,17 @@ prompt_default() {
 
 prompt_int() {
   local __var="${1:?}" prompt="${2:?}" default="${3:?}" input
-  while true; do
-    read -r -p "$prompt [$default]: " input || input=""
+  # Bug-hunt iter 322: NASA P10 Rule 2 — `while true` is unbounded.
+  # Operator typing garbage forever (or stdin piped with non-integer
+  # lines) loops indefinitely.  Cap at 10 attempts; on exhaustion fall
+  # back to the default rather than die — this is a prompt helper, not
+  # a security gate.  Same iter-278 cryo::ask_yn bounded-loop class.
+  local attempts=0
+  local MAX_PROMPT_ATTEMPTS=10
+  while (( attempts < MAX_PROMPT_ATTEMPTS )); do
+    attempts=$(( attempts + 1 ))
+    # Bug-hunt iter 687: read without size cap — iter-386 class.
+    read -r -n 4096 -p "$prompt [$default]: " input || input=""
     input="$(trim "$input")"
     if [[ -z "$input" ]]; then
       input="$default"
@@ -187,6 +215,8 @@ prompt_int() {
     fi
     echo "Please enter a non-negative integer."
   done
+  echo "Too many invalid inputs; using default: $default" >&2
+  printf -v "$__var" '%s' "$default"
 }
 
 prompt_choice() {
@@ -195,8 +225,14 @@ prompt_choice() {
   local options=("$@")
   options_display="$(IFS='/'; echo "${options[*]}")"
 
-  while true; do
-    read -r -p "$prompt [$options_display] (default: $default): " input || input=""
+  # Bug-hunt iter 323: NASA P10 Rule 2 — same iter-322/278 class.  Cap at 10
+  # attempts; fall back to default on exhaustion.
+  local attempts=0
+  local MAX_PROMPT_ATTEMPTS=10
+  while (( attempts < MAX_PROMPT_ATTEMPTS )); do
+    attempts=$(( attempts + 1 ))
+    # Bug-hunt iter 688: read without size cap — iter-386 class.
+    read -r -n 4096 -p "$prompt [$options_display] (default: $default): " input || input=""
     input="$(trim "$input")"
     if [[ -z "$input" ]]; then
       input="$default"
@@ -217,6 +253,8 @@ prompt_choice() {
 
     echo "Invalid choice: $input"
   done
+  echo "Too many invalid inputs; using default: $default" >&2
+  printf -v "$__var" '%s' "$default"
 }
 
 prompt_yes_no() {
@@ -236,8 +274,13 @@ prompt_yes_no() {
       ;;
   esac
 
-  while true; do
-    read -r -p "$prompt [$default_hint]: " input || input=""
+  # Bug-hunt iter 324: NASA P10 Rule 2 — same iter-322/323/278 class.
+  local attempts=0
+  local MAX_PROMPT_ATTEMPTS=10
+  while (( attempts < MAX_PROMPT_ATTEMPTS )); do
+    attempts=$(( attempts + 1 ))
+    # Bug-hunt iter 689: read without size cap — iter-386 class.
+    read -r -n 4096 -p "$prompt [$default_hint]: " input || input=""
     input="$(trim "$input")"
     if [[ -z "$input" ]]; then
       input="$default"
@@ -257,6 +300,12 @@ prompt_yes_no() {
         ;;
     esac
   done
+  echo "Too many invalid inputs; using default: $default" >&2
+  if [[ "$default" == "y" ]]; then
+    printf -v "$__var" '1'
+  else
+    printf -v "$__var" '0'
+  fi
 }
 
 interactive_wizard() {
@@ -273,8 +322,14 @@ interactive_wizard() {
     list_devices
     echo
 
-    while true; do
-      read -r -p "Device ID (leave empty for none): " device_input || device_input=""
+    # Bug-hunt iter 325: NASA P10 Rule 2 — same iter-322/323/324 class.
+    # Operator typing garbage device IDs forever locks the wizard.
+    local dev_attempts=0
+    local DEV_MAX_ATTEMPTS=10
+    while (( dev_attempts < DEV_MAX_ATTEMPTS )); do
+      dev_attempts=$(( dev_attempts + 1 ))
+      # Bug-hunt iter 690: read without size cap — iter-386 class.
+      read -r -n 4096 -p "Device ID (leave empty for none): " device_input || device_input=""
       device_input="$(trim "$device_input")"
 
       if [[ -z "$device_input" ]]; then
@@ -289,6 +344,10 @@ interactive_wizard() {
 
       echo "Unknown device ID: $device_input"
     done
+    if (( dev_attempts >= DEV_MAX_ATTEMPTS )); then
+      echo "Too many invalid device IDs; defaulting to none" >&2
+      DEVICE_ID=""
+    fi
   fi
 
   echo
@@ -319,25 +378,31 @@ interactive_wizard() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wake-phrase)
+      # Bug-hunt iter 496: $2 access without $# guard — iter-323 class; set -u aborts if $2 unbound.
+      [[ $# -ge 2 ]] || die "--wake-phrase requires a value"
       WAKE_PHRASE="$2"
       shift 2
       ;;
     --profile)
+      [[ $# -ge 2 ]] || die "--profile requires a value"
       TRAIN_PROFILE="$2"
       PROFILE_SET=1
       shift 2
       ;;
     --threads)
+      [[ $# -ge 2 ]] || die "--threads requires a value"
       TRAIN_THREADS="$2"
       THREADS_SET=1
       shift 2
       ;;
     --format)
+      [[ $# -ge 2 ]] || die "--format requires a value"
       MODEL_FORMAT="$2"
       FORMAT_SET=1
       shift 2
       ;;
     --device)
+      [[ $# -ge 2 ]] || die "--device requires a value"
       DEVICE_ID="$2"
       shift 2
       ;;
@@ -354,10 +419,12 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --positives)
+      [[ $# -ge 2 ]] || die "--positives requires a value"
       NUM_POSITIVES="$2"
       shift 2
       ;;
     --negatives)
+      [[ $# -ge 2 ]] || die "--negatives requires a value"
       NUM_NEGATIVES="$2"
       shift 2
       ;;

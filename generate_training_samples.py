@@ -107,9 +107,16 @@ PIPER_PREFERRED_HIGH_QUALITY_VOICES = [
 ]
 
 
+_MAX_VOICES_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB
+
+
 def fetch_piper_voices_index():
+    # Bug-hunt iter 352: json.load(response) from URL without size cap; large response could OOM.
     with urlopen(VOICES_JSON, timeout=30) as response:
-        return json.load(response)
+        data = response.read(_MAX_VOICES_RESPONSE_BYTES + 1)
+    if len(data) > _MAX_VOICES_RESPONSE_BYTES:
+        raise RuntimeError(f"Piper voices index too large (>{_MAX_VOICES_RESPONSE_BYTES}B)")
+    return json.loads(data)
 
 
 def _cached_high_quality_voices(download_dir: Path):
@@ -128,11 +135,17 @@ def resolve_piper_voice_pool(max_voices=8, download_dir: Path | None = None):
     high_english = []
     try:
         voices = fetch_piper_voices_index()
+        # Bug-hunt iter 355: iterating all voices without a cap; large index could loop without bound.
+        _VOICE_SCAN_CAP = 1_000
+        _voice_scanned = 0
         for name, meta in voices.items():
             quality = (meta or {}).get("quality", "")
             lang_code = ((meta or {}).get("language", {}) or {}).get("code", "")
             if quality == "high" and str(lang_code).startswith("en_"):
                 high_english.append(name)
+            _voice_scanned += 1
+            if _voice_scanned >= _VOICE_SCAN_CAP:
+                break
     except Exception as e:
         log(f"WARNING: failed to fetch Piper voices index; using cached voices only ({e})")
         if download_dir is not None:
@@ -225,6 +238,9 @@ def scan_existing_clips(outdir, prefix):
     existing_keys = set()
     max_idx = -1
     type_counts = Counter()
+    # Bug-hunt iter 353: glob without count cap — large output dir iterates without bound.
+    _SCAN_CAP = 50_000
+    _scanned = 0
     for wav in Path(outdir).glob(f"{prefix}_*.wav"):
         existing_names.add(wav.name)
         parts = wav.stem.split("_")
@@ -234,6 +250,9 @@ def scan_existing_clips(outdir, prefix):
         if key:
             existing_keys.add(key)
             type_counts[key.split(":", 1)[1]] += 1
+        _scanned += 1
+        if _scanned >= _SCAN_CAP:
+            break
     return existing_names, max_idx, existing_keys, type_counts
 
 
@@ -249,7 +268,10 @@ def alpha_token(index):
     if n < 0:
         n = 0
     chars = []
-    while True:
+    # Bug-hunt iter 354: while True has no explicit upper bound; NASA P10 Rule 2.
+    # log26(2**63) ≈ 13, so 15 iterations covers the full positive int64 range.
+    _max_iters = 15
+    for _ in range(_max_iters):
         n, rem = divmod(n, 26)
         chars.append(chr(ord("a") + rem))
         if n == 0:

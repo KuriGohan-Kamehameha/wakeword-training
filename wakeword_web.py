@@ -67,10 +67,18 @@ def load_workflows():
     }
     data = {"default": default, "devices": []}
     if os.path.exists(WORKFLOWS_PATH):
-        with open(WORKFLOWS_PATH, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        data["default"].update(loaded.get("default", {}))
-        data["devices"] = loaded.get("devices", [])
+        # Bug-hunt iter 348: json.load() without a file size cap — a large
+        # device_workflows.json consumed unbounded memory at import time (this
+        # runs at module load).  Workflows are config, not data; cap at 512 KB.
+        _MAX_WORKFLOWS_BYTES = 512 * 1024
+        _sz = os.path.getsize(WORKFLOWS_PATH)
+        if _sz > _MAX_WORKFLOWS_BYTES:
+            print(f"WARNING: {WORKFLOWS_PATH} is {_sz}B (> {_MAX_WORKFLOWS_BYTES}B cap); using defaults", flush=True)
+        else:
+            with open(WORKFLOWS_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            data["default"].update(loaded.get("default", {}))
+            data["devices"] = loaded.get("devices", [])
     if not data["devices"]:
         data["devices"] = [{"id": "custom_manual", "label": "Custom / Manual"}]
     return data
@@ -131,6 +139,12 @@ SAMPLE_PRESETS_JSON = json.dumps(SAMPLE_PRESETS, separators=(",", ":"), ensure_a
 DEFAULT_PRESET_ID = "m"
 
 app = Flask(__name__)
+# Bug-hunt iter 837: Flask's default MAX_CONTENT_LENGTH is unlimited.  This
+# Flask app accepts form POSTs that flow into subprocess argv (device_id,
+# profile, wake_phrase, etc.) — a multi-MB form body would blow up server
+# memory before any per-field cap fires.  Cap the request body at 1 MB; the
+# largest legitimate form is a handful of short strings.
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024
 proc = None
 current_run_dir = None
 last_exit_code = None
@@ -323,16 +337,23 @@ def start():
         current_run_dir = None
         last_exit_code = None
 
-    wake_phrase = request.form.get('wake_phrase', 'hey assistant')
-    device_id = request.form.get('device_id', 'custom_manual')
-    profile = request.form.get('profile', 'medium')
-    threads = request.form.get('threads', '1')
-    model_format = request.form.get('format', 'tflite')
-    piper_host_raw = request.form.get('piper_host', 'piper')
-    piper_port_raw = request.form.get('piper_port', '10200')
-    oww_host_raw = request.form.get('oww_host', 'openwakeword')
-    oww_port_raw = request.form.get('oww_port', '10400')
-    preset_id = request.form.get('sample_preset', DEFAULT_PRESET_ID)
+    # Bug-hunt iter 350: wake_phrase has no length cap; passed directly to subprocess as CLI arg.
+    wake_phrase = request.form.get('wake_phrase', 'hey assistant')[:200]
+    # Bug-hunt iter 838: every other form field flowed straight into subprocess
+    # argv with no per-field length cap.  iter 350 capped wake_phrase but the
+    # other 8 fields stayed unbounded.  Cap each at the largest plausible
+    # length so an oversized POST can't construct a multi-MB argv (some POSIX
+    # shells have ARG_MAX ~128 KB; a single 200 KB arg would silently truncate
+    # or fail the exec).
+    device_id = request.form.get('device_id', 'custom_manual')[:128]
+    profile = request.form.get('profile', 'medium')[:64]
+    threads = request.form.get('threads', '1')[:8]
+    model_format = request.form.get('format', 'tflite')[:32]
+    piper_host_raw = request.form.get('piper_host', 'piper')[:256]
+    piper_port_raw = request.form.get('piper_port', '10200')[:8]
+    oww_host_raw = request.form.get('oww_host', 'openwakeword')[:256]
+    oww_port_raw = request.form.get('oww_port', '10400')[:8]
+    preset_id = request.form.get('sample_preset', DEFAULT_PRESET_ID)[:32]
 
     device = DEVICE_MAP.get(device_id, {})
     defaults = WORKFLOWS.get('default', {})
@@ -347,6 +368,11 @@ def start():
 
     try:
         threads = int(threads)
+        # Bug-hunt iter 351: threads has no upper bound; cap at 32 to prevent enormous --train-threads.
+        if threads < 1:
+            threads = 1
+        elif threads > 32:
+            threads = 32
     except (TypeError, ValueError):
         threads = defaults.get('threads', 1)
 
@@ -426,7 +452,11 @@ def start():
     while time.time() - scan_start < timeout:
         runs_dir = os.path.join(BASE_DIR, 'training_runs')
         if os.path.isdir(runs_dir):
-            candidates = sorted(os.listdir(runs_dir))
+            # Bug-hunt iter 477: os.listdir without count cap — iter-338 class; NASA P10 Rule 2.
+            # Cap at 10 000 run directories; anything larger is a configuration error.
+            _MAX_RUN_DIRS = 10_000
+            _raw_candidates = sorted(os.listdir(runs_dir))
+            candidates = _raw_candidates[:_MAX_RUN_DIRS]
             latest = None
             latest_mtime = 0
             for c in candidates:
@@ -451,17 +481,30 @@ def log():
         is_running = bool(proc and proc.poll() is None)
         exit_code = last_exit_code
 
+    # Bug-hunt iter 836: log files were read via `f.read()[-20000:]` — that
+    # allocates the entire file into memory then slices.  Training logs can
+    # easily reach hundreds of MB after a long run.  Replace with a
+    # seek-from-end tail read so memory is bounded by the 20 KB window.
+    def _tail_read(path: str, n: int = 20000) -> str:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return ""
+        with open(path, 'rb') as f:
+            if size > n:
+                f.seek(size - n)
+            return f.read().decode('utf-8', errors='ignore')
+
     if not current_run_dir:
         # Fallback to CLI-captured trainer output
         out_log = os.path.join(BASE_DIR, 'logs', 'trainer_cli.log')
         if os.path.exists(out_log):
             try:
-                with open(out_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    data = f.read()[-20000:]
-                    status = "Training running..." if is_running else (
-                        f"Last run exit code: {exit_code}" if exit_code is not None else "No run started yet."
-                    )
-                    return jsonify(log=f"{status}\n\n{data}")
+                data = _tail_read(out_log)
+                status = "Training running..." if is_running else (
+                    f"Last run exit code: {exit_code}" if exit_code is not None else "No run started yet."
+                )
+                return jsonify(log=f"{status}\n\n{data}")
             except Exception as e:
                 return jsonify(log=f'Error reading fallback log: {e}')
         if exit_code is not None:
@@ -474,19 +517,17 @@ def log():
         out_log = os.path.join(BASE_DIR, 'logs', 'trainer_cli.log')
         if os.path.exists(out_log):
             try:
-                with open(out_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    data = f.read()[-20000:]
-                    status = "Training running..." if is_running else (
-                        f"Last run exit code: {exit_code}" if exit_code is not None else "Waiting for log..."
-                    )
-                    return jsonify(log=f"{status}\n\n{data}")
+                data = _tail_read(out_log)
+                status = "Training running..." if is_running else (
+                    f"Last run exit code: {exit_code}" if exit_code is not None else "Waiting for log..."
+                )
+                return jsonify(log=f"{status}\n\n{data}")
             except Exception as e:
                 return jsonify(log=f'Error reading fallback log: {e}')
         return jsonify(log='Log not yet created. Waiting...')
 
     try:
-        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-            data = f.read()[-20000:]
+        data = _tail_read(log_path)
         status = "Training running..." if is_running else (
             f"Last run exit code: {exit_code}" if exit_code is not None else "Training status unknown."
         )
@@ -507,4 +548,11 @@ if __name__ == '__main__':
             "Restrict at the network layer or revoke this env var.",
             flush=True,
         )
-    app.run(host=host, port=int(os.environ.get("PORT", "5000")))
+    # Bug-hunt iter 349: int(os.environ.get("PORT", "5000")) raises ValueError on non-numeric PORT.
+    _port_raw = os.environ.get("PORT", "5000").strip()
+    if _port_raw.isdigit() and 1 <= int(_port_raw) <= 65535:
+        _port = int(_port_raw)
+    else:
+        print(f"WARNING: PORT={_port_raw!r} is not a valid port number; using 5000", flush=True)
+        _port = 5000
+    app.run(host=host, port=_port)
