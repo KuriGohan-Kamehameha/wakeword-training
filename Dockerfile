@@ -81,8 +81,9 @@ RUN git clone https://github.com/dscripka/openWakeWord.git /workspace/openWakeWo
 # + this checkpoint, adversarial-negative generation dies with
 # ModuleNotFoundError('dp'), leaving negative_train empty and feature extraction
 # failing later with an opaque StopIteration.
-RUN curl -fL -o /workspace/openWakeWord_upstream/openwakeword/resources/en_us_cmudict_forward.pt \
-    "https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt"
+# (docker-native ADD: the slim base ships neither curl nor wget)
+ADD https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt \
+    /workspace/openWakeWord_upstream/openwakeword/resources/en_us_cmudict_forward.pt
 
 # Copy application files
 COPY . .

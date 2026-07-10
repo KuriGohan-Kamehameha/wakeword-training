@@ -29,10 +29,17 @@ import numpy as np
 
 MIN_DUR_S = 0.3
 MAX_DUR_S = 12.0
-SILENCE_RMS = 0.003          # full-scale fraction; below = effectively silent
+SILENCE_RMS = 0.0005         # full-scale fraction; below = digital silence
 CLIP_FRAC = 0.02             # >2% samples at rail = clipped
-FUZZY_POS = 0.62             # SequenceRatio threshold for positive match
+FUZZY_WIN = 0.75             # window SequenceRatio for phrase presence
+FUZZY_WORD = 0.72            # single-word ratio vs the phrase's anchor word
+FUZZY_SQUASH = 0.60          # space-squashed window ratio (bare-name lane)
 STT_TIMEOUT = 30
+# Generator kinds that are non-speech BY DESIGN: exempt from the silence
+# check (silence_* is supposed to be silent) and from the STT label check
+# (ASR models hallucinate speech on tones/noise — see negative_000043,
+# a 220 Hz tone transcribed as the wake phrase itself).
+NONSPEECH_RE = re.compile(r"(?:^|_)(silence|tone_|noise|chirp)", re.I)
 
 
 def norm(s):
@@ -70,9 +77,10 @@ def structural_issue(path):
         return "too short (%.2fs)" % dur
     if dur > MAX_DUR_S:
         return "too long (%.2fs)" % dur
-    rms = float(np.sqrt(np.mean(x * x)))
-    if rms < SILENCE_RMS:
-        return "silent (rms %.5f)" % rms
+    if not NONSPEECH_RE.search(Path(path).name):
+        rms = float(np.sqrt(np.mean(x * x)))
+        if rms < SILENCE_RMS:
+            return "silent (rms %.5f)" % rms
     clip = float(np.mean(np.abs(x) > 0.999))
     if clip > CLIP_FRAC:
         return "clipped (%.1f%% at rail)" % (clip * 100)
@@ -80,8 +88,16 @@ def structural_issue(path):
 
 
 def stt(url, path):
-    """Transcribe via kudzu-stt POST /stt. Returns text or None on error."""
-    body = Path(path).read_bytes()
+    """Transcribe via kudzu-stt POST /stt. Returns text or None on error.
+
+    Tolerates files vanishing mid-run (another actor quarantining/regenerating
+    the shared pool) — a missing file is a skip, not a crash.
+    """
+    try:
+        body = Path(path).read_bytes()
+    except OSError as e:
+        print("  [stt-skip] %s: %s" % (Path(path).name, e), file=sys.stderr)
+        return None
     req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "audio/wav"})
     try:
@@ -93,8 +109,20 @@ def stt(url, path):
     return out.get("text", "") if out.get("ok") else None
 
 
-def fuzzy_contains(text, phrase):
-    """Does `text` contain (a fuzzy version of) `phrase`?"""
+def fuzzy_contains(text, phrase, lenient=False):
+    """Does `text` contain (a fuzzy version of) `phrase`?
+
+    Two signals: (a) a phrase-sized word window resembling the whole phrase
+    (>= FUZZY_WIN — 0.62 was too loose: 'the plants' scores 0.64 against
+    'hey piranesi' on raw character ratio), or (b) any single transcript
+    word resembling the phrase's anchor word (its longest — 'piranesis'
+    vs 'piranesi' = 0.94, catching plural/inflected sound-alikes).
+
+    lenient=True additionally enables the bare-name lane below — use it ONLY
+    where context says the audio should BE the phrase (positive label checks).
+    On negatives it misfires: consonant-adjacent decoy phrases ('paranoia...',
+    'parentheses...') are valuable hard negatives, not poison.
+    """
     t, p = norm(text), norm(phrase)
     if not t:
         return False
@@ -102,12 +130,38 @@ def fuzzy_contains(text, phrase):
         return True
     words_t = t.split()
     words_p = p.split()
+    anchor = max(words_p, key=len)
+    for w in words_t:
+        if difflib.SequenceMatcher(None, w, anchor).ratio() >= FUZZY_WORD:
+            return True
     n = len(words_p)
     best = 0.0
     for i in range(0, max(1, len(words_t) - n + 1)):
         win = " ".join(words_t[i:i + n])
         best = max(best, difflib.SequenceMatcher(None, win, p).ratio())
-    return best >= FUZZY_POS
+    if best >= FUZZY_WIN:
+        return True
+    # Bare-name lane (single-word phrases only): an OOV wake word spoken with
+    # no context transcribes as phonetic fragments ("Per N S E", "Per inessie")
+    # that word-level matching can't see. Squash spaces and slide a
+    # phrase-length window. Kept off for multi-word phrases, where squashing
+    # would let genuinely-unintelligible positives through.
+    if lenient and len(words_p) == 1:
+        sq_t, sq_p = t.replace(" ", ""), p
+        if sq_p in sq_t:
+            return True
+        m = len(sq_p)
+        for i in range(0, max(1, len(sq_t) - m + 1)):
+            if difflib.SequenceMatcher(None, sq_t[i:i + m],
+                                       sq_p).ratio() >= FUZZY_SQUASH:
+                return True
+        # Spelled-out fragments ("Per N S E") lose their vowels but keep the
+        # consonant order — compare vowel-stripped skeletons by containment.
+        sk_t = re.sub(r"[aeiou]", "", sq_t)
+        sk_p = re.sub(r"[aeiou]", "", sq_p)
+        if len(sk_p) >= 3 and sk_p in sk_t:
+            return True
+    return False
 
 
 def main():
@@ -146,12 +200,13 @@ def main():
         checked += 1
         if text is None:
             continue                      # endpoint error — don't blame sample
-        if not fuzzy_contains(text, args.phrase):
+        if not fuzzy_contains(text, args.phrase, lenient=True):
             findings.append((f, "pos-label", "heard: %r" % text[:80]))
     print("positives label-checked: %d" % checked)
 
     rng = random.Random(7)
-    neg_ok = [f for f in neg if f not in bad_struct]
+    neg_ok = [f for f in neg if f not in bad_struct
+              and not NONSPEECH_RE.search(f.name)]
     sample = neg_ok if len(neg_ok) <= args.neg_sample else rng.sample(
         neg_ok, args.neg_sample)
     poison = 0
