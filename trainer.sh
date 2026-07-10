@@ -848,6 +848,13 @@ for k in ("n_samples",):
 for k in ("n_samples_val",):
     set_key_recursive(cfg, k, n_samples_val)
 
+# Upstream's example config ships max_negative_weight: 1500, tuned for its
+# ~50,000-positive auto-training corpora. At a few hundred positives that
+# imbalance makes 'never fire' the loss optimum — observed as a dead model
+# (accuracy 0.5, recall 0.0) that still exports cleanly. Scale with corpus.
+for k in ("max_negative_weight",):
+    set_key_recursive(cfg, k, max(5, n_samples // 20))
+
 if piper_generator_dir:
     for k in ("piper_sample_generator_path", "sample_generator_path"):
         set_key_recursive(cfg, k, piper_generator_dir)
