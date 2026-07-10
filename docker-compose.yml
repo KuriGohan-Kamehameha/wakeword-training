@@ -5,7 +5,7 @@ services:
     container_name: wakeword-piper
     restart: unless-stopped
     ports:
-      - "10200:10200"
+      - "10201:10200"
     volumes:
       - ./wakeword_lab/data/services/piper:/data
     command: >
@@ -26,7 +26,7 @@ services:
     container_name: wakeword-openwakeword
     restart: unless-stopped
     ports:
-      - "10400:10400"
+      - "10401:10400"
     volumes:
       - ./wakeword_lab/data/services/openwakeword:/data
       - ./wakeword_lab/data/custom_models:/custom-models:ro
