@@ -54,7 +54,7 @@ RUN pip install --no-cache-dir --upgrade pip==24.3.1 "setuptools==75.6.0" wheel=
     torch==2.8.0 \
     torchaudio==2.8.0 \
     espeak-phonemizer==1.3.1 \
-    piper-tts==1.2.0 \
+    piper-tts==1.3.0 \
     pathvalidate==3.2.1 \
     flask==3.1.0 \
     torchinfo==1.8.0 \
