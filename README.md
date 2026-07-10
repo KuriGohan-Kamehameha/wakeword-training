@@ -201,3 +201,23 @@ The report (`acoustic_runs/<slug>/acoustic_report.json`) gives per-clip max
 scores, whether positives separate from negatives, and a suggested threshold.
 A dead or overfit model shows up immediately as `separates: false` — synthetic
 eval alone will not tell you that.
+
+## GibberLink / data-over-sound channel test (`gibberlink_test.py`)
+
+Encodes text payloads as ggwave chirps, plays them through the remote
+loudspeaker, records the remote microphone, and decodes — a bit-exact proof of
+the acoustic channel (speaker, air, mic) independent of any speech model. The
+chirp clips are emitted as `neg_gibberlink_*.wav`, so scoring them against a
+wake model verifies it never fires on machine-to-machine chirp traffic
+sharing its airspace.
+
+```bash
+# encode (container) -> record via acoustic_live_test.py record --rate 48000 -> decode (container)
+docker compose run --rm trainer python3 gibberlink_test.py encode \
+    --out-dir /workspace/data/acoustic_clips/gibberlink --payloads "hello-mesh-1"
+# ... acoustic_live_test.py record --rate 48000 ...   (48 kHz: chirp tones alias away at 16 kHz)
+docker compose run --rm trainer python3 gibberlink_test.py decode --run-dir <run dir>
+```
+
+Verified live: 3/3 payloads decoded bit-perfect across a real room
+(full-volume playback, 48 kHz capture, different machines for speaker and mic).

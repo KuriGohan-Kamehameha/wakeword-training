@@ -82,7 +82,7 @@ def record_phase(args):
                 rec = subprocess.Popen(
                     ["ssh", *SSH_OPTS, args.mic_ssh,
                      f"timeout {int(dur) + 4} arecord -q -D {args.mic_device} "
-                     f"-f S16_LE -r 16000 -c 1 -d {int(dur + 0.999)} -t wav -"],
+                     f"-f S16_LE -r {args.rate} -c 1 -d {int(dur + 0.999)} -t wav -"],
                     stdout=f)
                 time.sleep(0.6)                   # let capture spin up
                 subprocess.run(
@@ -163,6 +163,9 @@ def main():
                      help="ssh target with the microphone")
     rec.add_argument("--mic-device", default="default",
                      help="ALSA capture device on the mic host")
+    rec.add_argument("--rate", type=int, default=16000,
+                     help="capture sample rate (use 48000 for ggwave chirps — "
+                          "their upper tones alias away at 16 kHz)")
     sco = sub.add_parser("score")
     sco.add_argument("--run-dir", required=True)
     sco.add_argument("--model-path", required=True)

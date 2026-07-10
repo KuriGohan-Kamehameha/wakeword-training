@@ -65,6 +65,7 @@ RUN pip install --no-cache-dir --upgrade pip==24.3.1 "setuptools==75.6.0" wheel=
     audiomentations==0.38.0 \
     webrtcvad==2.0.10 \
     torch-audiomentations==0.12.0 \
+    ggwave==0.4.2 \
     deep-phonemizer==0.0.19
 
 # Clone openWakeWord repository pinned to a specific commit.
