@@ -1089,7 +1089,11 @@ PY
     python3 openwakeword/train.py --training_config "$cfg_out" --train_model
     if [[ "$model_format" == "tflite" || "$model_format" == "both" ]]; then
       # Bug-hunt iter 494: mapfile without count cap — iter-338 class; NASA P10 Rule 2.
-      mapfile -t -n 256 fallback_onnxes < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+      # Sweep ONLY the run dir: including $repo_dir here also caught openWakeWord's
+      # per-run-downloaded RESOURCE models (melspectrogram.onnx has dynamic dims
+      # onnx2tf can't convert -> hard fail AFTER the trained model converted fine),
+      # and their .tflite twins are downloaded directly anyway.
+      mapfile -t -n 256 fallback_onnxes < <(find "$run_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
       [[ ${#fallback_onnxes[@]} -gt 0 ]] || die "No ONNX artifacts found for conversion."
       for onnx_path in "${fallback_onnxes[@]}"; do
         [[ -f "$onnx_path" ]] || continue
