@@ -138,3 +138,86 @@ cp wakeword_lab/data/custom_models/hey-piranesi.tflite \
 ```
 
 For more operational detail, see `README-docker.md`.
+
+## Dataset validation (malformed / mislabeled data)
+
+Synthetic corpora rot silently: TTS voices drift off-phrase, generators emit
+silent or clipped WAVs, and a single mislabeled negative poisons recall. The
+eval gate catches some of this *after* a full training run; `validate_dataset.py`
+catches it *before*, in seconds.
+
+```bash
+python3 validate_dataset.py --phrase "Hey Piranesi" --slug hey_piranesi \
+    --stt-url http://<your-stt-host>:5007/stt   # any endpoint speaking POST /stt -> {"text": ...}
+    # add --quarantine to move findings into a sibling _quarantine/ dir (never deletes)
+```
+
+Checks:
+
+- **structural** — unreadable/zero-frame WAVs, wrong sample width, <0.3 s or
+  >12 s, effectively-silent (RMS), clipped (>2 % of samples at the rail)
+- **pos-label** — every positive is transcribed by the external STT and
+  fuzzy-matched against the wake phrase; misses are listed with what was heard
+- **neg-poison** — a random sample of negatives (default 120) is transcribed;
+  any negative containing the wake phrase is flagged as a poison candidate
+
+Exit 0 = clean, 1 = findings (report printed), 2 = usage error. Run it after
+`--generate-samples` and before training; retrain only on a clean corpus.
+
+## Corpus augmentation from an external TTS (`generate_http_tts_samples.py`)
+
+The bundled generator tops out at ~5 `-high` Piper voices. Detector quality
+tracks corpus variety, so this sweeps any HTTP TTS (kudzu-tts/Kokoro-style
+`POST /tts {"text","voice","speed"} -> WAV`) across a voice x speed grid and
+appends matching-format samples (22050 Hz mono s16, collision-free 9NNNNN
+index space) to the same corpus:
+
+```bash
+python3 generate_http_tts_samples.py --wake-phrase "Hey Piranesi" \
+    --slug hey_piranesi --tts-url http://<host>:5006/tts
+# then re-run training WITHOUT --generate-samples to train on the merged corpus
+```
+
+Unknown voices are probed and skipped, so the broad default grid degrades
+gracefully. Prefer quality and variety over generation speed — the corpus is
+a one-time cost, the detector is forever.
+
+## Cross-device live acoustic testing (`acoustic_live_test.py`)
+
+Synthetic eval proves the model on synthetic audio only. This drives the loop
+that matters: a REAL loudspeaker on one machine plays labelled clips
+(`pos_*.wav` / `neg_*.wav`) into the room, a REAL microphone on another
+machine records them, and the trained model scores the recordings —
+acceptance + threshold selection grounded in your room, speaker, and mic.
+
+```bash
+./acoustic-live-test.sh hey_piranesi root@speaker-host plughw:AE5 mic-host plughw:AE5
+# or the two phases separately: `record` (host, needs ssh+alsa-utils on peers)
+# and `score` (inside the trainer container). Recordings are model-independent:
+# record once, score every candidate model against the same real-room audio.
+```
+
+The report (`acoustic_runs/<slug>/acoustic_report.json`) gives per-clip max
+scores, whether positives separate from negatives, and a suggested threshold.
+A dead or overfit model shows up immediately as `separates: false` — synthetic
+eval alone will not tell you that.
+
+## GibberLink / data-over-sound channel test (`gibberlink_test.py`)
+
+Encodes text payloads as ggwave chirps, plays them through the remote
+loudspeaker, records the remote microphone, and decodes — a bit-exact proof of
+the acoustic channel (speaker, air, mic) independent of any speech model. The
+chirp clips are emitted as `neg_gibberlink_*.wav`, so scoring them against a
+wake model verifies it never fires on machine-to-machine chirp traffic
+sharing its airspace.
+
+```bash
+# encode (container) -> record via acoustic_live_test.py record --rate 48000 -> decode (container)
+docker compose run --rm trainer python3 gibberlink_test.py encode \
+    --out-dir /workspace/data/acoustic_clips/gibberlink --payloads "hello-mesh-1"
+# ... acoustic_live_test.py record --rate 48000 ...   (48 kHz: chirp tones alias away at 16 kHz)
+docker compose run --rm trainer python3 gibberlink_test.py decode --run-dir <run dir>
+```
+
+Verified live: 3/3 payloads decoded bit-perfect across a real room
+(full-volume playback, 48 kHz capture, different machines for speaker and mic).
