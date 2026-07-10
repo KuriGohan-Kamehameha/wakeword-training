@@ -161,6 +161,29 @@ convert_onnx_with_onnx2tf() {
     # Avoid noisy optimizer traceback when onnxsim is intentionally absent.
     onnx2tf_args+=(--not_use_onnxsim)
   fi
+  # Preserve input layout EXACTLY: onnx2tf's channel-order heuristics transpose
+  # openwakeword's (1, frames, 96) input to (1, 96, frames), producing tflites
+  # every openwakeword runtime rejects with 'Cannot set tensor: Dimension
+  # mismatch'. -kat pins each input to its ONNX shape.
+  # onnx2tf matches -kat against its SANITIZED op names (e.g. 'onnx::Flatten_0'
+  # becomes 'onnx____Flatten_0') and silently ignores non-matches — emit the raw
+  # name plus common sanitisations so one of them lands.
+  local _onnx_inputs
+  _onnx_inputs=$(python3 - "$onnx_path" <<'PY'
+import sys
+import onnx
+m = onnx.load(sys.argv[1])
+names = []
+for i in m.graph.input:
+    n = i.name
+    names.extend({n, n.replace(":", "_"), n.replace(":", "__")})
+print(" ".join(names))
+PY
+)
+  local _in
+  for _in in $_onnx_inputs; do
+    onnx2tf_args+=(-kat "$_in")
+  done
   python3 -m onnx2tf "${onnx2tf_args[@]}"
 
   local candidate="$out_dir/${model_base}_float32.tflite"
