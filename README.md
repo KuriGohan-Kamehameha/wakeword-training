@@ -181,3 +181,23 @@ python3 generate_http_tts_samples.py --wake-phrase "Hey Piranesi" \
 Unknown voices are probed and skipped, so the broad default grid degrades
 gracefully. Prefer quality and variety over generation speed — the corpus is
 a one-time cost, the detector is forever.
+
+## Cross-device live acoustic testing (`acoustic_live_test.py`)
+
+Synthetic eval proves the model on synthetic audio only. This drives the loop
+that matters: a REAL loudspeaker on one machine plays labelled clips
+(`pos_*.wav` / `neg_*.wav`) into the room, a REAL microphone on another
+machine records them, and the trained model scores the recordings —
+acceptance + threshold selection grounded in your room, speaker, and mic.
+
+```bash
+./acoustic-live-test.sh hey_piranesi root@speaker-host plughw:AE5 mic-host plughw:AE5
+# or the two phases separately: `record` (host, needs ssh+alsa-utils on peers)
+# and `score` (inside the trainer container). Recordings are model-independent:
+# record once, score every candidate model against the same real-room audio.
+```
+
+The report (`acoustic_runs/<slug>/acoustic_report.json`) gives per-clip max
+scores, whether positives separate from negatives, and a suggested threshold.
+A dead or overfit model shows up immediately as `separates: false` — synthetic
+eval alone will not tell you that.
