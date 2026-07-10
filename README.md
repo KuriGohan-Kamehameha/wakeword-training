@@ -138,3 +138,28 @@ cp wakeword_lab/data/custom_models/hey-piranesi.tflite \
 ```
 
 For more operational detail, see `README-docker.md`.
+
+## Dataset validation (malformed / mislabeled data)
+
+Synthetic corpora rot silently: TTS voices drift off-phrase, generators emit
+silent or clipped WAVs, and a single mislabeled negative poisons recall. The
+eval gate catches some of this *after* a full training run; `validate_dataset.py`
+catches it *before*, in seconds.
+
+```bash
+python3 validate_dataset.py --phrase "Hey Piranesi" --slug hey_piranesi \
+    --stt-url http://<your-stt-host>:5007/stt   # any endpoint speaking POST /stt -> {"text": ...}
+    # add --quarantine to move findings into a sibling _quarantine/ dir (never deletes)
+```
+
+Checks:
+
+- **structural** — unreadable/zero-frame WAVs, wrong sample width, <0.3 s or
+  >12 s, effectively-silent (RMS), clipped (>2 % of samples at the rail)
+- **pos-label** — every positive is transcribed by the external STT and
+  fuzzy-matched against the wake phrase; misses are listed with what was heard
+- **neg-poison** — a random sample of negatives (default 120) is transcribed;
+  any negative containing the wake phrase is flagged as a poison candidate
+
+Exit 0 = clean, 1 = findings (report printed), 2 = usage error. Run it after
+`--generate-samples` and before training; retrain only on a clean corpus.
