@@ -664,6 +664,34 @@ PY
     log "WARNING: piper sample generator entrypoint not found at $piper_gen_py"
   fi
 
+  # Same PyTorch>=2.6 weights_only treatment for deep-phonemizer: its baked
+  # en_us_cmudict_forward.pt checkpoint pickles dp.preprocessing.text.Preprocessor,
+  # which torch.load's new weights_only=True default refuses — adversarial-text
+  # generation for OOV wake words then dies in Phonemizer.from_checkpoint.
+  # The checkpoint is a build-time artifact from the DeepPhonemizer release
+  # (trusted, baked into the image), so weights_only=False is appropriate.
+  python3 - <<'PY'
+from pathlib import Path
+
+try:
+    import dp.model.model as dp_model
+except ImportError:
+    raise SystemExit("deep-phonemizer not installed; skipping dp torch.load patch")
+path = Path(dp_model.__file__)
+if path.stat().st_size > 10 * 1024 * 1024:
+    raise SystemExit(f"dp model.py too large: {path.stat().st_size}B")
+text = path.read_text(encoding="utf-8")
+needle = "checkpoint = torch.load(checkpoint_path, map_location=device)"
+patched = "checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)"
+if patched in text:
+    print("dp load_checkpoint patch already present")
+elif needle in text:
+    path.write_text(text.replace(needle, patched, 1), encoding="utf-8")
+    print("Patched deep-phonemizer load_checkpoint for PyTorch>=2.6 compatibility")
+else:
+    print("WARNING: Could not locate expected torch.load() call in dp model.py")
+PY
+
   local piper_model_file="$piper_generator_dir/models/en-us-libritts-high.pt"
   # The submodule ships only the .pt.json sidecar — the ~243 MB checkpoint
   # comes from the rhasspy release (see piper-sample-generator/README.md).
