@@ -163,3 +163,21 @@ Checks:
 
 Exit 0 = clean, 1 = findings (report printed), 2 = usage error. Run it after
 `--generate-samples` and before training; retrain only on a clean corpus.
+
+## Corpus augmentation from an external TTS (`generate_http_tts_samples.py`)
+
+The bundled generator tops out at ~5 `-high` Piper voices. Detector quality
+tracks corpus variety, so this sweeps any HTTP TTS (kudzu-tts/Kokoro-style
+`POST /tts {"text","voice","speed"} -> WAV`) across a voice x speed grid and
+appends matching-format samples (22050 Hz mono s16, collision-free 9NNNNN
+index space) to the same corpus:
+
+```bash
+python3 generate_http_tts_samples.py --wake-phrase "Hey Piranesi" \
+    --slug hey_piranesi --tts-url http://<host>:5006/tts
+# then re-run training WITHOUT --generate-samples to train on the merged corpus
+```
+
+Unknown voices are probed and skipped, so the broad default grid degrades
+gracefully. Prefer quality and variety over generation speed — the corpus is
+a one-time cost, the detector is forever.
