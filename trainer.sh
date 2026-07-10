@@ -665,6 +665,23 @@ PY
   fi
 
   local piper_model_file="$piper_generator_dir/models/en-us-libritts-high.pt"
+  # The submodule ships only the .pt.json sidecar — the ~243 MB checkpoint
+  # comes from the rhasspy release (see piper-sample-generator/README.md).
+  # Self-heal: download once into the persistent data dir, reuse per run.
+  if [[ ! -f "$piper_model_file" ]]; then
+    local piper_model_cache="$data_dir/piper_generator_models/en-us-libritts-high.pt"
+    if [[ ! -f "$piper_model_cache" ]]; then
+      log "Piper generator checkpoint missing; downloading once (~243 MB) to $piper_model_cache"
+      mkdir -p "$(dirname "$piper_model_cache")"
+      if curl -fL --retry 2 -o "$piper_model_cache.part" \
+        "https://github.com/rhasspy/piper-sample-generator/releases/download/v1.0.0/en-us-libritts-high.pt"; then
+        mv "$piper_model_cache.part" "$piper_model_cache"
+      else
+        rm -f "$piper_model_cache.part"
+      fi
+    fi
+    [[ -f "$piper_model_cache" ]] && cp "$piper_model_cache" "$piper_model_file"
+  fi
   [[ -f "$piper_model_file" ]] || die "Missing Piper generator model file: $piper_model_file"
 
   local source_negative_dir="${DATA_NEGATIVE_DIR:-$data_dir/negatives}"
