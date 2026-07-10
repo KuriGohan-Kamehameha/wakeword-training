@@ -64,7 +64,8 @@ RUN pip install --no-cache-dir --upgrade pip==24.3.1 "setuptools==75.6.0" wheel=
     acoustics==0.2.6 \
     audiomentations==0.38.0 \
     webrtcvad==2.0.10 \
-    torch-audiomentations==0.12.0
+    torch-audiomentations==0.12.0 \
+    deep-phonemizer==0.0.19
 
 # Clone openWakeWord repository pinned to a specific commit.
 # Bumping the SHA is a deliberate one-line change reviewed in PR.
@@ -73,6 +74,15 @@ RUN git clone https://github.com/dscripka/openWakeWord.git /workspace/openWakeWo
     cd /workspace/openWakeWord_upstream && \
     git checkout "${OPENWAKEWORD_SHA}" && \
     pip install --no-cache-dir -e .
+
+# Bake the DeepPhonemizer checkpoint openWakeWord's generate_adversarial_texts
+# lazily fetches for wake words absent from cmudict (e.g. invented names —
+# exactly the words people train custom wake models for). Without deep-phonemizer
+# + this checkpoint, adversarial-negative generation dies with
+# ModuleNotFoundError('dp'), leaving negative_train empty and feature extraction
+# failing later with an opaque StopIteration.
+RUN curl -fL -o /workspace/openWakeWord_upstream/openwakeword/resources/en_us_cmudict_forward.pt \
+    "https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt"
 
 # Copy application files
 COPY . .
