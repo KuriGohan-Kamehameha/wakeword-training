@@ -39,8 +39,8 @@ RUN mkdir -p /workspace /workspace/custom_models /workspace/data
 RUN pip install --no-cache-dir --upgrade pip==24.3.1 "setuptools==75.6.0" wheel==0.45.1 && \
     pip install --no-cache-dir \
     pyyaml==6.0.2 \
-    numpy==2.1.3 \
-    "scipy==1.14.1" \
+    numpy==1.26.4 \
+    "scipy==1.12.0" \
     soundfile==0.12.1 \
     resampy==0.4.3 \
     tqdm==4.67.1 \
