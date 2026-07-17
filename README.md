@@ -4,9 +4,9 @@ Docker-first wakeword training for openWakeWord, with an end-to-end workflow tha
 
 ## Part of the Piranesi voice stack
 
-The **wake-word detector** half. Its sibling is **[AVAAS](https://github.com/P1R4N351/AVAAS)** — *Automated Voice Assimilation and Application System*, a browser studio that records and standardizes a voice into a corpus for TTS fine-tuning.
+The **wake-word detector** half. Its sibling is **[AVAAS](https://github.com/KuriGohan-Kamehameha/AVAAS)** — *Automated Voice Assimilation and Application System*, a browser studio that records and standardizes a voice into a corpus for TTS fine-tuning.
 
-They connect end to end: **AVAAS assimilates the voice → this trains the wake word for it.** Once AVAAS can synthesize a voice, it can produce *personalized* positive samples of the wake phrase **in that voice** to feed the sample-generation step here (alongside or instead of the generic `piper-sample-generator` voices) — yielding a detector tuned to how the speaker actually says it, not a generic TTS approximation.
+They connect end to end: **AVAAS assimilates the voice → this trains the wake word for it.** Once AVAAS can synthesize a voice, it can produce *personalized* positive samples of the wake phrase **in that voice**. Those samples augment—not replace—the generic `piper-sample-generator` voices, preserving speaker diversity while tuning the detector for Piranesi's own presentation.
 
 ## Platform support
 
@@ -116,6 +116,38 @@ Trainer exit codes (machine-consumable; last line on stderr is a JSON `{exit_cod
 ## Training a Piranesi-shaped wake word
 
 Piranesi's TTS path uses `en_US-lessac-low` for spoken output, which means a Vector running Piranesi's vector-override speaks in Lessac's voice. **Do not use `en_US-lessac-low` for positive sample generation when training a wake word that Piranesi himself might trigger** — it creates a feedback loop where the model learns to fire on Piranesi's own speech. Use the default diverse Piper pool (which prefers `*-high` voices, not `*-low`), or explicitly select 3+ voices that are not lessac-low.
+
+### Importing AVAAS positives
+
+AVAAS exports an immutable `avaas/wakeword-export@v1` directory containing
+the exact phrase `Hey Piranesi`, source voice/presentation and prosody
+provenance, mono 16 kHz PCM16 clips, a complete checksum inventory, and a
+`READY` marker written last. Import refuses symlinks, traversal, unexpected or
+executable files, corruption, incompatible audio, the wrong alias, and
+nonpromotable fixtures by default.
+
+```bash
+python3 avaas_import.py \
+  /path/to/hey-piranesi-export-v1 \
+  wakeword_lab/data/avaas_imports
+```
+
+The command is append-only and idempotent. Point training at one or more
+validated imported bundle directories (comma-separated):
+
+```bash
+export AVAAS_IMPORT_DIRS="$PWD/wakeword_lab/data/avaas_imports/hey-piranesi-export-v1"
+./docker-train.sh --wake-phrase "Hey Piranesi"
+```
+
+After openWakeWord generates its generic Piper clips, the trainer validates
+the AVAAS bundle again and deterministically copies its clips into the real
+`positive_train` and `positive_test` directories before normalization and
+augmentation. It enforces independent generic, personalized, and total count
+gates and writes `avaas-personalized-stage.json` into the run directory.
+
+`--allow-nonpromotable` and `AVAAS_ALLOW_NONPROMOTABLE=1` exist only for
+synthetic contract smoke tests; never use them for a release model.
 
 Quick start:
 

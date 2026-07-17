@@ -49,6 +49,15 @@ PowerShell equivalent:
 ```
 
 Generated positives are stored per wakeword in `wakeword_lab/data/positives/<wakeword_slug>/` and use highest-quality available Piper voices plus speech variants.
+
+Validated AVAAS positives can be added without displacing this generic set.
+First import the bundle with `python3 avaas_import.py <bundle>
+wakeword_lab/data/avaas_imports`, then set `AVAAS_IMPORT_DIRS` to the imported
+bundle directory before running `docker-train.sh`. The trainer stages AVAAS
+clips after `--generate_clips` and before normalize/augment, with defaults of
+at least 6 generic and 8 personalized positives and no more than 512
+personalized positives. See the main README for the immutable contract and
+fixture safety rules.
 Generated negatives are pooled in `wakeword_lab/data/negatives/`, append-only, and include both non-speech and speech (diverse voices + diverse non-wake phrases).
 
 The generator appends only unique clips and does not discard previous data.

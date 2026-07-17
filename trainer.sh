@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# P10 RELAXATIONS:
+# R4: parse_args is a finite, bounded argv case table, and the ONNX fallback is
+# a linear transaction. Splitting either would duplicate shift/cleanup state
+# across functions and make their fail-closed behavior harder to audit.
+
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_VERSION="2.0.0-docker"
 
@@ -45,6 +50,9 @@ Environment overrides:
   WYOMING_PIPER_HOST, WYOMING_PIPER_PORT,
   WYOMING_OPENWAKEWORD_HOST, WYOMING_OPENWAKEWORD_PORT,
   MAX_POSITIVE_SAMPLES, MAX_NEGATIVE_SAMPLES, MIN_PER_SOURCE, DATASET_SEED,
+  AVAAS_IMPORT_DIRS, AVAAS_MIN_GENERIC_POSITIVES,
+  AVAAS_MIN_PERSONALIZED_POSITIVES, AVAAS_MAX_PERSONALIZED_POSITIVES,
+  AVAAS_MAX_TOTAL_POSITIVES, AVAAS_ALLOW_NONPROMOTABLE, AVAAS_STAGE_DRY_RUN,
   ALLOW_LOW_DISK, MIN_FREE_DISK_GB, NON_INTERACTIVE.
 USAGE
 }
@@ -95,6 +103,14 @@ trap 'on_err $LINENO' ERR
 require_cmd() {
   local c="${1:?}"
   command -v "$c" >/dev/null 2>&1 || die "Missing required command: ${c}"
+}
+
+remove_onnx_temp_tree() {
+  local target="${1:?}" parent="${2:?}"
+  [[ -d "$target" && ! -L "$target" ]] || die "Refusing invalid ONNX temp tree: $target"
+  [[ "$(dirname "$target")" == "$parent" ]] || die "Refusing ONNX temp tree outside work root: $target"
+  [[ "$(basename "$target")" == onnx2tf_* ]] || die "Refusing unexpected ONNX temp tree: $target"
+  rm -r -- "$target"
 }
 
 convert_onnx_with_onnx2tf() {
@@ -172,9 +188,9 @@ convert_onnx_with_onnx2tf() {
   cp -f "$candidate" "$output_tflite"
   deactivate >/dev/null 2>&1 || true
 
-  rm -rf "$out_dir" 2>/dev/null || true
+  remove_onnx_temp_tree "$out_dir" "$work_root"
   if [[ "$cleanup_work_root" -eq 1 ]]; then
-    rm -rf "$work_root" 2>/dev/null || true
+    rmdir -- "$work_root"
   fi
 
   log "Fallback conversion complete: $onnx_path -> $output_tflite"
@@ -544,6 +560,8 @@ main() {
 
   local dataset_generator="$script_dir/generate_dataset.py"
   [[ -f "$dataset_generator" ]] || die "Missing dataset generator: $dataset_generator"
+  local avaas_stager="$script_dir/stage_personalized_positives.py"
+  [[ -f "$avaas_stager" ]] || die "Missing AVAAS positive stager: $avaas_stager"
 
   local host_piper="${WYOMING_PIPER_HOST:-127.0.0.1}"
   local port_piper="${WYOMING_PIPER_PORT:-10200}"
@@ -955,6 +973,51 @@ PY
       return 1
     }
     run_generate_clips
+    if [[ -n "${AVAAS_IMPORT_DIRS:-}" ]]; then
+      mapfile -t -n 2 avaas_split_dirs < <(CFG_OUT="$cfg_out" python3 - <<'PY'
+import os
+import yaml
+
+path = os.environ["CFG_OUT"]
+size = os.path.getsize(path) if os.path.exists(path) else 0
+if not 1 <= size <= 1024 * 1024:
+    raise SystemExit("training config size outside bounds")
+with open(path, "r", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle)
+if not isinstance(config, dict):
+    raise SystemExit("training config root must be a mapping")
+output_dir = config.get("output_dir")
+model_name = config.get("model_name")
+if not isinstance(output_dir, str) or not output_dir or not isinstance(model_name, str) or not model_name:
+    raise SystemExit("training config lacks output_dir/model_name")
+feature_dir = os.path.join(output_dir, model_name)
+print(os.path.join(feature_dir, "positive_train"))
+print(os.path.join(feature_dir, "positive_test"))
+PY
+)
+      [[ ${#avaas_split_dirs[@]} -eq 2 ]] || die_with_code "Could not resolve openWakeWord positive split directories." 5 "avaas_stage_config"
+      local -a avaas_stage_args
+      avaas_stage_args=(
+        --imports "$AVAAS_IMPORT_DIRS"
+        --positive-train "${avaas_split_dirs[0]}"
+        --positive-test "${avaas_split_dirs[1]}"
+        --seed "${DATASET_SEED:-42}"
+        --min-generic "${AVAAS_MIN_GENERIC_POSITIVES:-6}"
+        --min-personalized "${AVAAS_MIN_PERSONALIZED_POSITIVES:-8}"
+        --max-personalized "${AVAAS_MAX_PERSONALIZED_POSITIVES:-512}"
+        --max-total "${AVAAS_MAX_TOTAL_POSITIVES:-20000}"
+      )
+      if [[ "${AVAAS_ALLOW_NONPROMOTABLE:-0}" == "1" ]]; then
+        avaas_stage_args+=(--allow-nonpromotable)
+      fi
+      python3 "$avaas_stager" "${avaas_stage_args[@]}"
+      log "Staged validated AVAAS positives into openWakeWord's generated train/test directories."
+      if [[ "${AVAAS_STAGE_DRY_RUN:-0}" == "1" ]]; then
+        : > "$run_dir/.avaas-stage-dry-run-complete"
+        log "AVAAS staging dry run complete; skipping normalize, augment, and model training."
+        exit 0
+      fi
+    fi
     # Bug-hunt iter 481: $cfg_out interpolated into unquoted Python heredoc —
     # iter-227 class; path with embedded quotes would break the string literal.
     # Pass via environment variable instead.
@@ -1053,6 +1116,12 @@ PY
     fi
   ) 2>&1 | tee -a "$log_file"
 
+  if [[ "${AVAAS_STAGE_DRY_RUN:-0}" == "1" ]]; then
+    [[ -f "$run_dir/.avaas-stage-dry-run-complete" ]] || die_with_code "AVAAS staging dry run did not complete." 4 "avaas_stage_dry_run"
+    log "AVAAS staging dry run artifacts retained for inspection at $run_dir/$model_slug."
+    return 0
+  fi
+
   # Bug-hunt iter 495: mapfile without count cap — iter-338 class; NASA P10 Rule 2.
   mapfile -t -n 256 tflites < <(find "$run_dir" "$repo_dir" -type f -name "*.tflite" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
   mapfile -t -n 256 onnxes  < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx"  -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
@@ -1093,6 +1162,7 @@ PY
   manifest_oww_version="$(python3 -c 'import openwakeword; print(getattr(openwakeword, "__version__", "unknown"))' 2>/dev/null || echo unknown)"
   local manifest_built_at; manifest_built_at="$(timestamp_utc)"
   local manifest_voices_csv="${PIPER_VOICES_USED:-}"
+  local avaas_stage_receipt="$run_dir/$model_slug/avaas-personalized-stage.json"
 
   # Read selected counts from the dataset_counts array (set after
   # generate_dataset.py at line 788-789). Passing $num_positives /
@@ -1109,10 +1179,10 @@ PY
     python3 - "$manifest_path" "$artifact_name" "$wake_phrase" "$model_slug" \
                 "$manifest_pos" "$manifest_neg" "$train_profile" "$train_threads" \
                 "$manifest_built_at" "$manifest_repo_sha" "$manifest_oww_version" \
-                "${DEVICE_ID:-}" "$manifest_voices_csv" <<'PY' || die_with_code "manifest emit failed for $artifact_name" 4 "manifest_io"
+                "${DEVICE_ID:-}" "$manifest_voices_csv" "$avaas_stage_receipt" <<'PY' || die_with_code "manifest emit failed for $artifact_name" 4 "manifest_io"
 import json, sys, os
 (path, artifact, phrase, slug, n_pos, n_neg, profile, threads,
- built_at, repo_sha, oww_ver, device_id, voices_csv) = sys.argv[1:14]
+ built_at, repo_sha, oww_ver, device_id, voices_csv, avaas_receipt_path) = sys.argv[1:15]
 # Hot-fix W-1: fail loud on null counts. A manifest with
 # training_params.positives=null is structurally valid but semantically
 # empty and will silently corrupt every downstream consumer that reads
@@ -1122,6 +1192,22 @@ negatives = int(n_neg) if str(n_neg).isdigit() else None
 assert positives is not None, f"manifest emit got null positives count (raw={n_pos!r}); dataset_counts unset?"
 assert negatives is not None, f"manifest emit got null negatives count (raw={n_neg!r}); dataset_counts unset?"
 voices = [v.strip() for v in voices_csv.split(",") if v.strip()] if voices_csv else []
+avaas_stage = None
+personalized_positives = 0
+if os.path.exists(avaas_receipt_path):
+    receipt_size = os.path.getsize(avaas_receipt_path)
+    if not 1 <= receipt_size <= 2 * 1024 * 1024:
+        raise ValueError("AVAAS stage receipt size outside bounds")
+    with open(avaas_receipt_path, "r", encoding="utf-8") as handle:
+        avaas_stage = json.load(handle)
+    if not isinstance(avaas_stage, dict) or avaas_stage.get("schema") != "wakeword-training/avaas-stage@v1":
+        raise ValueError("AVAAS stage receipt schema mismatch")
+    counts = avaas_stage.get("counts")
+    if not isinstance(counts, dict) or not isinstance(counts.get("personalized"), int):
+        raise ValueError("AVAAS stage receipt lacks personalized count")
+    personalized_positives = counts["personalized"]
+    if not 0 <= personalized_positives <= 512:
+        raise ValueError("AVAAS personalized count outside bounds")
 manifest = {
     "schema": "wakeword-training/manifest@v1",
     "phrase": phrase,
@@ -1129,12 +1215,15 @@ manifest = {
     "artifact": artifact,
     "device_target": device_id or None,
     "training_params": {
-        "positives": positives,
+        "positives": positives + personalized_positives,
+        "generic_positives": positives,
+        "personalized_positives": personalized_positives,
         "negatives": negatives,
         "profile": profile,
         "threads": int(threads) if str(threads).isdigit() else None,
     },
     "piper_voices_used": voices,
+    "avaas_personalized_stage": avaas_stage,
     "built_at": built_at,
     "repo_sha": repo_sha,
     "openwakeword_version": oww_ver,

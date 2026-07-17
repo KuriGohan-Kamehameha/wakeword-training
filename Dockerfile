@@ -78,7 +78,8 @@ RUN git clone https://github.com/dscripka/openWakeWord.git /workspace/openWakeWo
 COPY . .
 
 # Make scripts executable
-RUN chmod +x trainer.sh docker-train.sh generate_dataset.py generate_training_samples.py 2>/dev/null || true
+RUN chmod +x trainer.sh docker-train.sh generate_dataset.py generate_training_samples.py \
+    avaas_import.py stage_personalized_positives.py 2>/dev/null || true
 
 # Set environment variables
 ENV PYTHONPATH=/workspace/openWakeWord_upstream

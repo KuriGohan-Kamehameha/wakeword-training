@@ -1,7 +1,8 @@
 services:
   # Wyoming Piper TTS service
   piper:
-    image: rhasspy/wyoming-piper:latest
+    # Multi-architecture index digest resolved from Docker Hub on 2026-07-16.
+    image: rhasspy/wyoming-piper@sha256:69b7f797ae3a8c3c0202cbf97152fb795d78c2355de2a31655c20671247360d8
     container_name: wakeword-piper
     restart: unless-stopped
     ports:
@@ -22,7 +23,8 @@ services:
 
   # Wyoming openWakeWord service
   openwakeword:
-    image: rhasspy/wyoming-openwakeword:latest
+    # Multi-architecture index digest resolved from Docker Hub on 2026-07-16.
+    image: rhasspy/wyoming-openwakeword@sha256:52cb1168731a1849fc28cf339c935fde58746bbabc94226668a40ef6ddf5d42b
     container_name: wakeword-openwakeword
     restart: unless-stopped
     ports:
@@ -61,6 +63,11 @@ services:
       - TRAIN_PROFILE=${TRAIN_PROFILE:-medium}
       - TRAIN_THREADS=${TRAIN_THREADS:-2}
       - MODEL_FORMAT=${MODEL_FORMAT:-tflite}
+      - AVAAS_IMPORT_DIRS=${AVAAS_IMPORT_DIRS:-}
+      - AVAAS_MIN_GENERIC_POSITIVES=${AVAAS_MIN_GENERIC_POSITIVES:-6}
+      - AVAAS_MIN_PERSONALIZED_POSITIVES=${AVAAS_MIN_PERSONALIZED_POSITIVES:-8}
+      - AVAAS_MAX_PERSONALIZED_POSITIVES=${AVAAS_MAX_PERSONALIZED_POSITIVES:-512}
+      - AVAAS_MAX_TOTAL_POSITIVES=${AVAAS_MAX_TOTAL_POSITIVES:-20000}
     volumes:
       - ./:/app:ro
       - ./wakeword_lab/data:/workspace/data
