@@ -22,10 +22,16 @@ jobs:
       - name: Shell syntax check
         run: bash -n docker-train.sh trainer.sh
 
-      - name: Install Docker Compose
+      - name: Ensure Docker Compose v2
+        # ubuntu-latest ships Compose v2 preinstalled, and docker-compose-plugin is
+        # not in the runner apt sources (apt-get exited 100). Install from the Ubuntu
+        # archive only if Compose is genuinely missing.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y docker-compose-plugin
+          if ! docker compose version; then
+            sudo apt-get update
+            sudo apt-get install -y docker-compose-v2
+          fi
+          docker compose version
 
       - name: Compose config validation
         run: docker compose config >/dev/null
