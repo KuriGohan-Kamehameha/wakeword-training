@@ -17,7 +17,15 @@ container; record/play need only ssh + alsa-utils on the peers):
 
 The host-side transport reuses acoustic_live_test.py's record phase (chirp
 clips are named neg_gibberlink_*.wav so the wake-model scorer treats them as
-must-not-fire negatives). gibberlink-test.sh orchestrates all phases.
+must-not-fire negatives). Run the three steps in order:
+
+  1. gibberlink_test.py encode --out-dir DIR --payloads "msg1" "msg2"
+  2. acoustic_live_test.py record --clips-dir DIR --out-dir DIR/run \
+         --speaker-ssh SPEAKER --mic-ssh MIC
+  3. gibberlink_test.py decode --run-dir DIR/run
+
+decode reads gibberlink.json from the run dir or its parent, so keep the
+run dir inside the encode dir (or copy gibberlink.json into it).
 """
 import argparse
 import json

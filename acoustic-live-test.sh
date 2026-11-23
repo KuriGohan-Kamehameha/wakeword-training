@@ -8,8 +8,8 @@
 # Usage:
 #   ./acoustic-live-test.sh SLUG SPEAKER_SSH SPEAKER_DEV MIC_SSH MIC_DEV [MODEL]
 # e.g.
-#   ./acoustic-live-test.sh hey_piranesi root@100.111.40.21 plughw:AE5 \
-#       internode-0 plughw:AE5
+#   ./acoustic-live-test.sh hey_piranesi root@speaker-host plughw:AE5 \
+#       mic-host plughw:AE5
 #
 # Clips are read from  wakeword_lab/data/acoustic_clips/SLUG/
 # Recordings + report land in  wakeword_lab/data/acoustic_runs/SLUG/

@@ -14,8 +14,8 @@ openwakeword, i.e. run it inside the trainer container):
   python3 acoustic_live_test.py record \
       --clips-dir wakeword_lab/data/acoustic_clips/hey_piranesi \
       --out-dir   wakeword_lab/data/acoustic_runs/hey_piranesi \
-      --speaker-ssh root@100.111.40.21 --speaker-device plughw:AE5 \
-      --mic-ssh internode-0 --mic-device plughw:AE5
+      --speaker-ssh root@speaker-host --speaker-device plughw:AE5 \
+      --mic-ssh mic-host --mic-device plughw:AE5
 
   # 2. score the recordings with the trained model (inside the trainer container)
   docker compose run --rm trainer python3 acoustic_live_test.py score \

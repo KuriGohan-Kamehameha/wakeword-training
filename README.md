@@ -148,7 +148,7 @@ catches it *before*, in seconds.
 
 ```bash
 python3 validate_dataset.py --phrase "Hey Piranesi" --slug hey_piranesi \
-    --stt-url http://<your-stt-host>:5007/stt   # any endpoint speaking POST /stt -> {"text": ...}
+    --stt-url http://<your-stt-host>:5007/stt   # any endpoint speaking POST /stt -> {"ok": true, "text": ...}
     # add --quarantine to move findings into a sibling _quarantine/ dir (never deletes)
 ```
 
