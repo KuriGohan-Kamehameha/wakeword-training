@@ -161,6 +161,29 @@ convert_onnx_with_onnx2tf() {
     # Avoid noisy optimizer traceback when onnxsim is intentionally absent.
     onnx2tf_args+=(--not_use_onnxsim)
   fi
+  # Preserve input layout EXACTLY: onnx2tf's channel-order heuristics transpose
+  # openwakeword's (1, frames, 96) input to (1, 96, frames), producing tflites
+  # every openwakeword runtime rejects with 'Cannot set tensor: Dimension
+  # mismatch'. -kat pins each input to its ONNX shape.
+  # onnx2tf matches -kat against its SANITIZED op names (e.g. 'onnx::Flatten_0'
+  # becomes 'onnx____Flatten_0') and silently ignores non-matches — emit the raw
+  # name plus common sanitisations so one of them lands.
+  local _onnx_inputs
+  _onnx_inputs=$(python3 - "$onnx_path" <<'PY'
+import sys
+import onnx
+m = onnx.load(sys.argv[1])
+names = []
+for i in m.graph.input:
+    n = i.name
+    names.extend({n, n.replace(":", "_"), n.replace(":", "__")})
+print(" ".join(names))
+PY
+)
+  local _in
+  for _in in $_onnx_inputs; do
+    onnx2tf_args+=(-kat "$_in")
+  done
   python3 -m onnx2tf "${onnx2tf_args[@]}"
 
   local candidate="$out_dir/${model_base}_float32.tflite"
@@ -664,7 +687,52 @@ PY
     log "WARNING: piper sample generator entrypoint not found at $piper_gen_py"
   fi
 
+  # Same PyTorch>=2.6 weights_only treatment for deep-phonemizer: its baked
+  # en_us_cmudict_forward.pt checkpoint pickles dp.preprocessing.text.Preprocessor,
+  # which torch.load's new weights_only=True default refuses — adversarial-text
+  # generation for OOV wake words then dies in Phonemizer.from_checkpoint.
+  # The checkpoint is a build-time artifact from the DeepPhonemizer release
+  # (trusted, baked into the image), so weights_only=False is appropriate.
+  python3 - <<'PY'
+from pathlib import Path
+
+try:
+    import dp.model.model as dp_model
+except ImportError:
+    raise SystemExit("deep-phonemizer not installed; skipping dp torch.load patch")
+path = Path(dp_model.__file__)
+if path.stat().st_size > 10 * 1024 * 1024:
+    raise SystemExit(f"dp model.py too large: {path.stat().st_size}B")
+text = path.read_text(encoding="utf-8")
+needle = "checkpoint = torch.load(checkpoint_path, map_location=device)"
+patched = "checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)"
+if patched in text:
+    print("dp load_checkpoint patch already present")
+elif needle in text:
+    path.write_text(text.replace(needle, patched, 1), encoding="utf-8")
+    print("Patched deep-phonemizer load_checkpoint for PyTorch>=2.6 compatibility")
+else:
+    print("WARNING: Could not locate expected torch.load() call in dp model.py")
+PY
+
   local piper_model_file="$piper_generator_dir/models/en-us-libritts-high.pt"
+  # The submodule ships only the .pt.json sidecar — the ~243 MB checkpoint
+  # comes from the rhasspy release (see piper-sample-generator/README.md).
+  # Self-heal: download once into the persistent data dir, reuse per run.
+  if [[ ! -f "$piper_model_file" ]]; then
+    local piper_model_cache="$data_dir/piper_generator_models/en-us-libritts-high.pt"
+    if [[ ! -f "$piper_model_cache" ]]; then
+      log "Piper generator checkpoint missing; downloading once (~243 MB) to $piper_model_cache"
+      mkdir -p "$(dirname "$piper_model_cache")"
+      if curl -fL --retry 2 -o "$piper_model_cache.part" \
+        "https://github.com/rhasspy/piper-sample-generator/releases/download/v1.0.0/en-us-libritts-high.pt"; then
+        mv "$piper_model_cache.part" "$piper_model_cache"
+      else
+        rm -f "$piper_model_cache.part"
+      fi
+    fi
+    [[ -f "$piper_model_cache" ]] && cp "$piper_model_cache" "$piper_model_file"
+  fi
   [[ -f "$piper_model_file" ]] || die "Missing Piper generator model file: $piper_model_file"
 
   local source_negative_dir="${DATA_NEGATIVE_DIR:-$data_dir/negatives}"
@@ -779,6 +847,13 @@ for k in ("n_samples",):
 
 for k in ("n_samples_val",):
     set_key_recursive(cfg, k, n_samples_val)
+
+# Upstream's example config ships max_negative_weight: 1500, tuned for its
+# ~50,000-positive auto-training corpora. At a few hundred positives that
+# imbalance makes 'never fire' the loss optimum — observed as a dead model
+# (accuracy 0.5, recall 0.0) that still exports cleanly. Scale with corpus.
+for k in ("max_negative_weight",):
+    set_key_recursive(cfg, k, max(5, n_samples // 20))
 
 if piper_generator_dir:
     for k in ("piper_sample_generator_path", "sample_generator_path"):
@@ -1044,7 +1119,11 @@ PY
     python3 openwakeword/train.py --training_config "$cfg_out" --train_model
     if [[ "$model_format" == "tflite" || "$model_format" == "both" ]]; then
       # Bug-hunt iter 494: mapfile without count cap — iter-338 class; NASA P10 Rule 2.
-      mapfile -t -n 256 fallback_onnxes < <(find "$run_dir" "$repo_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
+      # Sweep ONLY the run dir: including $repo_dir here also caught openWakeWord's
+      # per-run-downloaded RESOURCE models (melspectrogram.onnx has dynamic dims
+      # onnx2tf can't convert -> hard fail AFTER the trained model converted fine),
+      # and their .tflite twins are downloaded directly anyway.
+      mapfile -t -n 256 fallback_onnxes < <(find "$run_dir" -type f -name "*.onnx" -newer "$run_dir/.start_time" 2>/dev/null | sort || true)
       [[ ${#fallback_onnxes[@]} -gt 0 ]] || die "No ONNX artifacts found for conversion."
       for onnx_path in "${fallback_onnxes[@]}"; do
         [[ -f "$onnx_path" ]] || continue

@@ -623,7 +623,7 @@ def gen_negatives(outdir, count=50, min_new=50, synthesizer=None, voice_pool=Non
 def main():
     parser = argparse.ArgumentParser(description="Generate training samples")
     parser.add_argument("--wake-phrase", default="hello world", help="Wake word phrase")
-    parser.add_argument("--data-dir", default="./wakeword_lab/data", help="Output directory for samples")
+    parser.add_argument("--data-dir", default=os.environ.get("BASE_DIR", "./wakeword_lab/data"), help="Output directory for samples (defaults to $BASE_DIR when set, e.g. in the compose trainer where the repo mount is read-only)")
     parser.add_argument("--positives", type=int, default=50, help="Number of positive samples")
     parser.add_argument("--negatives", type=int, default=50, help="Number of negative samples")
     parser.add_argument("--min-new-negatives", type=int, default=50, help="Minimum new unique negatives to append each run")
